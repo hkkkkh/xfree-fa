@@ -65,10 +65,11 @@ PROXY_VERSION = "1.8"
 # v1.8: in-memory page cache. Jina upstream takes ~14s per /page even
 # when the Render service is warm (Render free CPU + Jina slowness from
 # Render's egress), and the app used to pay that on EVERY load — plus a
-# second Markdown fetch on failure. Cache home/search/tag pages for 90s
-# so repeat loads (back-navigation, retry, second format) are instant.
+# second Markdown fetch on failure. Cache home/search/tag pages for 300s
+# (home content turns over slowly; a few-minutes-stale list is a fair
+# trade for a ~1s load instead of ~15s) so repeat loads are instant.
 _PAGE_CACHE = {}  # (path, want_md) -> (body_bytes, content_type, at)
-_PAGE_CACHE_TTL = 90
+_PAGE_CACHE_TTL = 300
 _PAGE_CACHE_LOCK = threading.Lock()
 
 CHUNK = 256 * 1024  # v1.4: fewer, bigger writes = faster streaming
@@ -173,11 +174,12 @@ class Handler(BaseHTTPRequestHandler):
 
         self.send_text(404, "not found")
 
-    def send_cached_page(self, body, ctype):
+    def send_cached_page(self, body, ctype, hit=True):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Proxy-Version", PROXY_VERSION)
+        self.send_header("X-Proxy-Cache", "HIT" if hit else "MISS")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         if self.command != "HEAD":
@@ -229,7 +231,7 @@ class Handler(BaseHTTPRequestHandler):
                      else "text/html; charset=utf-8")
             with _PAGE_CACHE_LOCK:
                 _PAGE_CACHE[cache_key] = (body, ctype, time.time())
-            self.send_cached_page(body, ctype)
+            self.send_cached_page(body, ctype, hit=False)
             return
         # Fallback: direct fetch of the site page (works when the
         # server's IP is not Cloudflare-challenged).
@@ -241,7 +243,7 @@ class Handler(BaseHTTPRequestHandler):
             ctype = "text/html; charset=utf-8"
             with _PAGE_CACHE_LOCK:
                 _PAGE_CACHE[cache_key] = (body, ctype, time.time())
-            self.send_cached_page(body, ctype)
+            self.send_cached_page(body, ctype, hit=False)
         except Exception:
             self.send_text(502, "upstream failed: %s" % last_exc)
 
