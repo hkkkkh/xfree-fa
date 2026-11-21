@@ -60,16 +60,14 @@ ALLOWED_HOSTS = {
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-PROXY_VERSION = "1.8"
+PROXY_VERSION = "1.9"
 
-# v1.8: in-memory page cache. Jina upstream takes ~14s per /page even
-# when the Render service is warm (Render free CPU + Jina slowness from
-# Render's egress), and the app used to pay that on EVERY load — plus a
-# second Markdown fetch on failure. Cache home/search/tag pages for 300s
-# (home content turns over slowly; a few-minutes-stale list is a fair
-# trade for a ~1s load instead of ~15s) so repeat loads are instant.
+# v1.9: 900s TTL — the keep-alive pings /page every 12 min, so the
+# cache must outlive the ping interval or the home page is cold again.
+# Home content turns over slowly; a 15-min-stale list is a fair trade
+# for a ~1s load instead of ~9s through Jina.
 _PAGE_CACHE = {}  # (path, want_md) -> (body_bytes, content_type, at)
-_PAGE_CACHE_TTL = 300
+_PAGE_CACHE_TTL = 900
 _PAGE_CACHE_LOCK = threading.Lock()
 
 CHUNK = 256 * 1024  # v1.4: fewer, bigger writes = faster streaming
@@ -180,6 +178,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Proxy-Version", PROXY_VERSION)
         self.send_header("X-Proxy-Cache", "HIT" if hit else "MISS")
+        # v1.9 diagnostic: what the upstream (Jina/direct) actually did
+        # and how long it took, e.g. "jina:200:8.4s" or "jina:429:2.0s".
+        # The ~9s MISS cost lives here, not in the app — this header
+        # proves whether it is Jina slowness or a 429 retry from Render.
+        upstream = getattr(self, "_upstream", "")
+        if upstream:
+            self.send_header("X-Upstream", upstream)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         if self.command != "HEAD":
@@ -206,12 +211,19 @@ class Handler(BaseHTTPRequestHandler):
         # it mid-wake — on mobile, where Jina-direct is dead, that was
         # the whole feed failing. Now 2 x 20s: worst ~44s server-side,
         # well inside the app's 150s mobile read budget.
+        # v1.9: record what Jina actually did (status + seconds) in
+        # self._upstream, sent back as the X-Upstream header — the
+        # ~9s MISS cost is measured here, not guessed.
         body = None
         last_exc = None
+        upstream_info = []
+        t_start = time.time()
         for attempt in range(2):
             try:
                 with fetch_stream(jina_url, headers, timeout=20) as resp:
                     if resp.status == 429 or resp.status >= 500:
+                        upstream_info.append("jina:%s:%.1fs"
+                                             % (resp.status, time.time() - t_start))
                         retry_after = resp.headers.get("Retry-After")
                         wait = 2 * (attempt + 1)
                         if retry_after:
@@ -222,10 +234,14 @@ class Handler(BaseHTTPRequestHandler):
                         time.sleep(wait)
                         continue
                     body = resp.read()
+                    upstream_info.append("jina:%s:%.1fs"
+                                         % (resp.status, time.time() - t_start))
                 break
             except Exception as exc:
                 last_exc = exc
+                upstream_info.append("jina:exc:%.1fs" % (time.time() - t_start))
                 time.sleep(2 * (attempt + 1))
+        self._upstream = ";".join(upstream_info)
         if body is not None:
             ctype = ("text/markdown; charset=utf-8" if want_md
                      else "text/html; charset=utf-8")
@@ -237,9 +253,12 @@ class Handler(BaseHTTPRequestHandler):
         # server's IP is not Cloudflare-challenged).
         try:
             direct = "https://www.xfree.com" + path
+            t_direct = time.time()
             with fetch_stream(direct, {"User-Agent": UA},
                              timeout=20) as resp:
                 body = resp.read()
+            self._upstream += ";direct:%s:%.1fs" % (
+                resp.status, time.time() - t_direct)
             ctype = "text/html; charset=utf-8"
             with _PAGE_CACHE_LOCK:
                 _PAGE_CACHE[cache_key] = (body, ctype, time.time())
