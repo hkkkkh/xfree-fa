@@ -58,7 +58,8 @@ ALLOWED_HOSTS = {
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-CHUNK = 64 * 1024
+CHUNK = 256 * 1024  # v1.4: fewer, bigger writes = faster streaming
+                      # through the 0.1-CPU Render free instance
 
 
 def fetch_stream(url, headers, timeout=30):
@@ -93,6 +94,9 @@ class Handler(BaseHTTPRequestHandler):
             value = resp.headers.get(name)
             if value:
                 self.send_header(name, value)
+        # v1.4: thumbnails never change — let clients/CDNs cache them a day
+        if self.path.startswith("/img") and not resp.headers.get("Cache-Control"):
+            self.send_header("Cache-Control", "public, max-age=86400")
         for name, value in extra_headers:
             self.send_header(name, value)
         self.send_header("Access-Control-Allow-Origin", "*")
