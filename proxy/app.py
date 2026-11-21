@@ -42,6 +42,7 @@ bandwidth limits — fine for personal use, not for sharing publicly.
 """
 
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -57,6 +58,8 @@ ALLOWED_HOSTS = {
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+PROXY_VERSION = "1.6"
 
 CHUNK = 256 * 1024  # v1.4: fewer, bigger writes = faster streaming
                       # through the 0.1-CPU Render free instance
@@ -80,6 +83,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Proxy-Version", PROXY_VERSION)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         if self.command != "HEAD":
@@ -99,6 +103,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "public, max-age=86400")
         for name, value in extra_headers:
             self.send_header(name, value)
+        self.send_header("X-Proxy-Version", PROXY_VERSION)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         if self.command == "HEAD":
@@ -167,35 +172,61 @@ class Handler(BaseHTTPRequestHandler):
         jina_url = "https://r.jina.ai/https://www.xfree.com" + path
         headers = self.upstream_headers(
             {} if want_md else {"X-Return-Format": "html"})
-        try:
-            with fetch_stream(jina_url, headers, timeout=30) as resp:
-                body = resp.read()
+        # v1.6: retry Jina with backoff (429/5xx/timeout) BEFORE falling
+        # back to a direct fetch. The old code gave up on the first
+        # Jina failure, and the direct fallback returns Cloudflare
+        # HTML or a 403 — which is why search failed on the phone
+        # (search is usually the 2nd/3rd request in a burst, the one
+        # Jina rate-limits) while the first home load worked.
+        body = None
+        last_exc = None
+        for attempt in range(3):
+            try:
+                with fetch_stream(jina_url, headers, timeout=45) as resp:
+                    if resp.status == 429 or resp.status >= 500:
+                        retry_after = resp.headers.get("Retry-After")
+                        wait = 2 * (attempt + 1)
+                        if retry_after:
+                            try:
+                                wait = max(wait, int(retry_after))
+                            except ValueError:
+                                pass
+                        time.sleep(wait)
+                        continue
+                    body = resp.read()
+                break
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(2 * (attempt + 1))
+        if body is not None:
             self.send_response(200)
             self.send_header("Content-Type",
                              "text/markdown; charset=utf-8" if want_md
                              else "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Proxy-Version", PROXY_VERSION)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(body)
-        except Exception as exc:
-            # Fallback: direct fetch of the site page (works when the
-            # server's IP is not Cloudflare-challenged).
-            try:
-                direct = "https://www.xfree.com" + path
-                with fetch_stream(direct, {"User-Agent": UA},
-                                 timeout=20) as resp:
-                    body = resp.read()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                if self.command != "HEAD":
-                    self.wfile.write(body)
-            except Exception:
-                self.send_text(502, "upstream failed: %s" % exc)
+            return
+        # Fallback: direct fetch of the site page (works when the
+        # server's IP is not Cloudflare-challenged).
+        try:
+            direct = "https://www.xfree.com" + path
+            with fetch_stream(direct, {"User-Agent": UA},
+                             timeout=20) as resp:
+                body = resp.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Proxy-Version", PROXY_VERSION)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except Exception:
+            self.send_text(502, "upstream failed: %s" % last_exc)
 
     def handle_binary(self, query, _kind):
         target = (query.get("u") or [""])[0]
@@ -203,14 +234,22 @@ class Handler(BaseHTTPRequestHandler):
                 or not self.allowed(target):
             self.send_text(400, "bad or disallowed url")
             return
-        try:
-            with fetch_stream(target, self.upstream_headers(),
-                             timeout=30) as resp:
-                self.stream_response(resp)
-        except urllib.error.HTTPError as exc:
-            self.send_text(exc.code or 502, "upstream error %s" % exc.code)
-        except Exception as exc:
-            self.send_text(502, "upstream failed: %s" % exc)
+        # v1.6: one retry on failure (a first-attempt hiccup must not
+        # blank a thumbnail that would load on the second try).
+        last_exc = None
+        for attempt in range(2):
+            try:
+                with fetch_stream(target, self.upstream_headers(),
+                                 timeout=30) as resp:
+                    self.stream_response(resp)
+                return
+            except urllib.error.HTTPError as exc:
+                self.send_text(exc.code or 502, "upstream error %s" % exc.code)
+                return
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(1)
+        self.send_text(502, "upstream failed: %s" % last_exc)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 {
-  "apkUrl": "https://github.com/hkkkkh/xfree-fa/releases/download/v1.4/xfree-fa-1.4.apk",
-  "notes": "نسخه ۱٫۴: حداکثر سرعت — مستقیم اول، دانلود چندبخشی موازی، کش عکس، مسابقه سریع‌ترین مسیر، پیش‌بارگذاری",
-  "versionCode": 5,
-  "versionName": "1.4"
+  "apkUrl": "https://github.com/hkkkkh/xfree-fa/releases/download/v1.6/xfree-fa-1.6.apk",
+  "notes": "نسخه ۱٫۶ (روش Study→Build→Check): عکس‌ها اول از پروکسی (موبایل) با تایم‌اوت بلند، جستجو با تلاش دوباره Jina، پخش با مهلت ۶۰ ثانیه برای بیدار شدن پروکسی",
+  "versionCode": 7,
+  "versionName": "1.6"
 }
