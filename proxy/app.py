@@ -42,6 +42,7 @@ bandwidth limits — fine for personal use, not for sharing publicly.
 """
 
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -59,7 +60,16 @@ ALLOWED_HOSTS = {
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-PROXY_VERSION = "1.6"
+PROXY_VERSION = "1.8"
+
+# v1.8: in-memory page cache. Jina upstream takes ~14s per /page even
+# when the Render service is warm (Render free CPU + Jina slowness from
+# Render's egress), and the app used to pay that on EVERY load — plus a
+# second Markdown fetch on failure. Cache home/search/tag pages for 90s
+# so repeat loads (back-navigation, retry, second format) are instant.
+_PAGE_CACHE = {}  # (path, want_md) -> (body_bytes, content_type, at)
+_PAGE_CACHE_TTL = 90
+_PAGE_CACHE_LOCK = threading.Lock()
 
 CHUNK = 256 * 1024  # v1.4: fewer, bigger writes = faster streaming
                       # through the 0.1-CPU Render free instance
@@ -163,26 +173,42 @@ class Handler(BaseHTTPRequestHandler):
 
         self.send_text(404, "not found")
 
+    def send_cached_page(self, body, ctype):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Proxy-Version", PROXY_VERSION)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
     def handle_page(self, query):
         path = (query.get("path") or [""])[0]
         if not path.startswith("/"):
             self.send_text(400, "path must start with /")
             return
         want_md = (query.get("format") or [""])[0] == "md"
+        cache_key = (path, want_md)
+        with _PAGE_CACHE_LOCK:
+            hit = _PAGE_CACHE.get(cache_key)
+            if hit is not None and time.time() - hit[2] < _PAGE_CACHE_TTL:
+                self.send_cached_page(hit[0], hit[1])
+                return
         jina_url = "https://r.jina.ai/https://www.xfree.com" + path
         headers = self.upstream_headers(
             {} if want_md else {"X-Return-Format": "html"})
-        # v1.6: retry Jina with backoff (429/5xx/timeout) BEFORE falling
-        # back to a direct fetch. The old code gave up on the first
-        # Jina failure, and the direct fallback returns Cloudflare
-        # HTML or a 403 — which is why search failed on the phone
-        # (search is usually the 2nd/3rd request in a burst, the one
-        # Jina rate-limits) while the first home load worked.
+        # v1.7: BOUND the Jina attempts. v1.6 allowed 3 x 45s = 135s+
+        # server-side, so on a cold Render service (wake 30-60s) the
+        # /page reply could pass 90s and the app's read timeout killed
+        # it mid-wake — on mobile, where Jina-direct is dead, that was
+        # the whole feed failing. Now 2 x 20s: worst ~44s server-side,
+        # well inside the app's 150s mobile read budget.
         body = None
         last_exc = None
-        for attempt in range(3):
+        for attempt in range(2):
             try:
-                with fetch_stream(jina_url, headers, timeout=45) as resp:
+                with fetch_stream(jina_url, headers, timeout=20) as resp:
                     if resp.status == 429 or resp.status >= 500:
                         retry_after = resp.headers.get("Retry-After")
                         wait = 2 * (attempt + 1)
@@ -199,16 +225,11 @@ class Handler(BaseHTTPRequestHandler):
                 last_exc = exc
                 time.sleep(2 * (attempt + 1))
         if body is not None:
-            self.send_response(200)
-            self.send_header("Content-Type",
-                             "text/markdown; charset=utf-8" if want_md
-                             else "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("X-Proxy-Version", PROXY_VERSION)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(body)
+            ctype = ("text/markdown; charset=utf-8" if want_md
+                     else "text/html; charset=utf-8")
+            with _PAGE_CACHE_LOCK:
+                _PAGE_CACHE[cache_key] = (body, ctype, time.time())
+            self.send_cached_page(body, ctype)
             return
         # Fallback: direct fetch of the site page (works when the
         # server's IP is not Cloudflare-challenged).
@@ -217,14 +238,10 @@ class Handler(BaseHTTPRequestHandler):
             with fetch_stream(direct, {"User-Agent": UA},
                              timeout=20) as resp:
                 body = resp.read()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("X-Proxy-Version", PROXY_VERSION)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(body)
+            ctype = "text/html; charset=utf-8"
+            with _PAGE_CACHE_LOCK:
+                _PAGE_CACHE[cache_key] = (body, ctype, time.time())
+            self.send_cached_page(body, ctype)
         except Exception:
             self.send_text(502, "upstream failed: %s" % last_exc)
 

@@ -1,6 +1,1 @@
-{
-  "apkUrl": "https://github.com/hkkkkh/xfree-fa/releases/download/v1.6/xfree-fa-1.6.apk",
-  "notes": "نسخه ۱٫۶ (روش Study→Build→Check): عکس‌ها اول از پروکسی (موبایل) با تایم‌اوت بلند، جستجو با تلاش دوباره Jina، پخش با مهلت ۶۰ ثانیه برای بیدار شدن پروکسی",
-  "versionCode": 7,
-  "versionName": "1.6"
-}
+{"apkUrl":"https://github.com/hkkkkh/xfree-fa/releases/download/v1.8/xfree-fa-1.8.apk","notes":"نسخه ۱٫۸: با اینترنت گوشی هم پروکسی و جینا همزمان مسابقه می‌دهند (هر کدام زودتر جواب بده لیست می‌آید)؛ خطا علت دقیق هر مسیر را نشان می‌دهد؛ پروکسی صفحه‌ها را ۹۰ ثانیه کش می‌کند","versionCode":9,"versionName":"1.8"}
