@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: xfree-fa-proxy
+    runtime: python
+    rootDir: proxy
+    buildCommand: echo "no dependencies - stdlib only"
+    startCommand: python app.py
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
