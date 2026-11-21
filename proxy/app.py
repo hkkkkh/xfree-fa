@@ -80,6 +80,19 @@ def fetch_stream(url, headers, timeout=30):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+def looks_like_page(body):
+    """True if a fetched body is the real site page, not a Cloudflare
+    challenge / block page. A challenge page must never be cached or
+    returned — it would poison the cache for 15 minutes."""
+    if body is None or len(body) < 1000:
+        return False
+    low = body[:2000].lower()
+    if b"just a moment" in low or b"cf-challenge" in low \
+            or b"attention required" in low or b"captcha" in low:
+        return False
+    return True
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -202,45 +215,62 @@ class Handler(BaseHTTPRequestHandler):
             if hit is not None and time.time() - hit[2] < _PAGE_CACHE_TTL:
                 self.send_cached_page(hit[0], hit[1])
                 return
-        jina_url = "https://r.jina.ai/https://www.xfree.com" + path
-        headers = self.upstream_headers(
-            {} if want_md else {"X-Return-Format": "html"})
-        # v1.7: BOUND the Jina attempts. v1.6 allowed 3 x 45s = 135s+
-        # server-side, so on a cold Render service (wake 30-60s) the
-        # /page reply could pass 90s and the app's read timeout killed
-        # it mid-wake — on mobile, where Jina-direct is dead, that was
-        # the whole feed failing. Now 2 x 20s: worst ~44s server-side,
-        # well inside the app's 150s mobile read budget.
-        # v1.9: record what Jina actually did (status + seconds) in
-        # self._upstream, sent back as the X-Upstream header — the
-        # ~9s MISS cost is measured here, not guessed.
+        # v1.9: DIRECT FIRST. Live X-Upstream measurements (2026-11-21)
+        # proved Jina is currently UNREACHABLE from Render — both Jina
+        # attempts throw instantly (0.1-0.3s, then ~2.2s) — while a
+        # direct fetch of www.xfree.com from Render returns HTTP 200
+        # with the real page (24 wall__item cards) in 1.2-1.8s. The old
+        # Jina-first order wasted ~6.5s on two doomed Jina attempts +
+        # sleeps before the direct fallback ever ran: that was the
+        # ~9s /page cost. Direct may be Cloudflare-challenged on some
+        # IPs/times (it is from this VM), so the direct body is
+        # VALIDATED before use: a challenge page is never cached or
+        # returned — Jina is the fallback for exactly that case.
         body = None
         last_exc = None
         upstream_info = []
         t_start = time.time()
-        for attempt in range(2):
-            try:
-                with fetch_stream(jina_url, headers, timeout=20) as resp:
-                    if resp.status == 429 or resp.status >= 500:
+        direct = "https://www.xfree.com" + path
+        try:
+            with fetch_stream(direct, {"User-Agent": UA},
+                             timeout=10) as resp:
+                candidate = resp.read()
+            upstream_info.append("direct:%s:%.1fs"
+                                 % (resp.status, time.time() - t_start))
+            if resp.status == 200 and looks_like_page(candidate):
+                body = candidate
+        except Exception as exc:
+            last_exc = exc
+            upstream_info.append("direct:%s:%.1fs"
+                                 % (type(exc).__name__, time.time() - t_start))
+        if body is None:
+            jina_url = "https://r.jina.ai/https://www.xfree.com" + path
+            headers = self.upstream_headers(
+                {} if want_md else {"X-Return-Format": "html"})
+            for attempt in range(2):
+                try:
+                    with fetch_stream(jina_url, headers, timeout=20) as resp:
+                        if resp.status == 429 or resp.status >= 500:
+                            upstream_info.append("jina:%s:%.1fs"
+                                                 % (resp.status, time.time() - t_start))
+                            retry_after = resp.headers.get("Retry-After")
+                            wait = 2 * (attempt + 1)
+                            if retry_after:
+                                try:
+                                    wait = max(wait, int(retry_after))
+                                except ValueError:
+                                    pass
+                            time.sleep(wait)
+                            continue
+                        body = resp.read()
                         upstream_info.append("jina:%s:%.1fs"
                                              % (resp.status, time.time() - t_start))
-                        retry_after = resp.headers.get("Retry-After")
-                        wait = 2 * (attempt + 1)
-                        if retry_after:
-                            try:
-                                wait = max(wait, int(retry_after))
-                            except ValueError:
-                                pass
-                        time.sleep(wait)
-                        continue
-                    body = resp.read()
+                    break
+                except Exception as exc:
+                    last_exc = exc
                     upstream_info.append("jina:%s:%.1fs"
-                                         % (resp.status, time.time() - t_start))
-                break
-            except Exception as exc:
-                last_exc = exc
-                upstream_info.append("jina:exc:%.1fs" % (time.time() - t_start))
-                time.sleep(2 * (attempt + 1))
+                                         % (type(exc).__name__, time.time() - t_start))
+                    time.sleep(2 * (attempt + 1))
         self._upstream = ";".join(upstream_info)
         if body is not None:
             ctype = ("text/markdown; charset=utf-8" if want_md
@@ -249,22 +279,7 @@ class Handler(BaseHTTPRequestHandler):
                 _PAGE_CACHE[cache_key] = (body, ctype, time.time())
             self.send_cached_page(body, ctype, hit=False)
             return
-        # Fallback: direct fetch of the site page (works when the
-        # server's IP is not Cloudflare-challenged).
-        try:
-            direct = "https://www.xfree.com" + path
-            t_direct = time.time()
-            with fetch_stream(direct, {"User-Agent": UA},
-                             timeout=20) as resp:
-                body = resp.read()
-            self._upstream += ";direct:%s:%.1fs" % (
-                resp.status, time.time() - t_direct)
-            ctype = "text/html; charset=utf-8"
-            with _PAGE_CACHE_LOCK:
-                _PAGE_CACHE[cache_key] = (body, ctype, time.time())
-            self.send_cached_page(body, ctype, hit=False)
-        except Exception:
-            self.send_text(502, "upstream failed: %s" % last_exc)
+        self.send_text(502, "upstream failed: %s" % last_exc)
 
     def handle_binary(self, query, _kind):
         target = (query.get("u") or [""])[0]
