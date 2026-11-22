@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""XFreeFa live Persian dubbing — proxy side (v3.2, dub 1.0).
+"""XFreeFa live Persian dubbing — proxy side (v3.3, dub 1.2).
 
 Self-contained, standard library only (no pip installs on Render free).
 Mounted by proxy/app.py: /dub/health (GET) and /dub/segment (POST).
@@ -17,16 +17,26 @@ Nothing here needs a key, a login or a paid service:
             for a 2.5 s clip, POSTing raw 16-bit PCM (audio/l16) — no FLAC
             encoder needed. Without the key the endpoint answers
             400 "Missing parameter: key"; the v1 endpoint is 404-dead.
-  TRANSLATE (v3.3 chain) Google Translate free gtx endpoint on
-            translate.googleapis.com, then gtx on translate.google.com,
-            then MyMemory (api.mymemory.translated.net, no key). Render's
-            shared egress IP times out on translate.googleapis.com gtx
-            (verified live 2026-11-22: 2x 10 s timeouts, while the same
-            call works from this VM), so one dead host must not kill
-            dubbing. A host that failed is skipped for 60 s. /dub/health
-            probes every candidate and reports which one works.
-            (Gemini was considered and ruled out: the Gemini key lives
-            in Muse's secure vault and cannot be put on Render.)
+  TRANSLATE (v3.3 chain, dub 1.2) Google Translate free gtx endpoint
+            on translate.googleapis.com, then gtx on translate.google.com,
+            then MyMemory (api.mymemory.translated.net, no key). LIVE
+            FROM RENDER (verified 2026-11-22): Google answers BOTH gtx
+            hosts with a 302 to /sorry/index — Render's shared egress IP
+            is blocked by Google ("unusual traffic"), in any code path
+            (the /g/ relay gets the same 302). MyMemory WITHOUT de=
+            429s on shared IPs (anonymous 5,000 chars/day/IP exhausted);
+            WITH de=xfree-fa@example.com it works (documented 50,000
+            chars/day; de is only a quota key, no account). So from
+            Render the chain in practice runs on MyMemory. A host that
+            failed is skipped for 60 s. /dub/health probes every
+            candidate and reports which one works. (Gemini was
+            considered and ruled out: the Gemini key lives in Muse's
+            secure vault and cannot be put on Render. Also tried and
+            rejected 2026-11-22: Bing ttranslatev3 (statusCode 205 even
+            with a fresh IG token), DeepL free jsonrpc ("older version"
+            reject), Edge translator + LibreTranslate argos (timeouts),
+            AllOrigins->gtx (522), SimplyTranslate (empty result),
+            Lingva (disconnected).)
   TTS       Microsoft Edge Read-Aloud neural voices over WebSocket
             (speech.platform.bing.com, fa-IR-DilaraNeural female /
             fa-IR-FaridNeural male, no key, no login). The protocol needs
@@ -81,7 +91,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-DUB_VERSION = "1.1"
+DUB_VERSION = "1.2"
 
 # ----------------------------------------------------------------------
 # Tunables
@@ -578,10 +588,14 @@ def _translate_gtx_host(text, src, dst, host, timeout):
 
 
 def _translate_mymemory(text, src, dst, timeout=8):
-    """MyMemory free API (no key). Text or None. Returns None when
-    the shared-IP anonymous quota is finished (quotaFinished)."""
+    """MyMemory free API (no key). Text or None. The anonymous quota
+    is 5,000 chars/day per IP and the shared Render/VM IPs hit HTTP
+    429 on it; passing de=<email> raises it to 50,000 chars/day
+    (documented MyMemory behaviour — de is only a quota key, no
+    account, no verification). quotaFinished sits at the TOP level
+    of the response, not inside responseData."""
     url = ("https://api.mymemory.translated.net/get?q=%s"
-           "&langpair=%s|%s"
+           "&langpair=%s|%s&de=xfree-fa@example.com"
            % (urllib.parse.quote(text), urllib.parse.quote(src),
               urllib.parse.quote(dst)))
     req = urllib.request.Request(url, headers={
@@ -592,9 +606,9 @@ def _translate_mymemory(text, src, dst, timeout=8):
         data = json.loads(resp.read().decode("utf-8", "replace"))
     if data.get("responseStatus") != 200:
         return None
-    rdata = data.get("responseData") or {}
-    if rdata.get("quotaFinished"):
+    if data.get("quotaFinished"):
         return None
+    rdata = data.get("responseData") or {}
     out = (rdata.get("translatedText") or "").strip()
     if not out or "MYMEMORY WARNING" in out or "NO QUERY" in out:
         return None
