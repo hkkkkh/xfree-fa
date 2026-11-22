@@ -90,7 +90,7 @@ ALLOWED_HOSTS = {
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-PROXY_VERSION = "2.6"
+PROXY_VERSION = "2.7"
 
 # v1.9: 900s TTL — the keep-alive pings /page every 12 min, so the
 # cache must outlive the ping interval or the home page is cold again.
@@ -458,9 +458,21 @@ class Handler(BaseHTTPRequestHandler):
             return base + "/video?u=" + urllib.parse.quote(u, safe="")
         text = re.sub(r"https://thumbs\.xfree\.com/[^\s\"'<>]+", _thumb, text)
         text = re.sub(r"https://cdn\.xfree\.com/[^\s\"'<>]+", _cdn, text)
-        # v2.6: the site's JS bundles + icons come from static.xfree.com
-        # (110 references on the homepage) — route them through the
-        # proxy too, or the site never boots in the WebView.
+        # v2.7: static.xfree.com is ~25s+ per request FROM Render's IP
+        # (measured 2026-11-22: /static?u=<js> took 25s for 9 KB, and
+        # /_nuxt/<same file> via www.xfree.com took 0.77s) — the site
+        # rewrites every JS bundle through /static, so Nuxt never
+        # booted in the WebView and the page stayed black. The same
+        # bundles are served by www.xfree.com under /_nuxt/, so .js
+        # goes there (fast reverse proxy); only non-JS static assets
+        # (icons/svg) still use /static — they can be slow without
+        # blocking the boot.
+        def _static_js(m):
+            u = m.group(0)
+            name = u.rsplit("/", 1)[-1]
+            return base + "/_nuxt/" + name
+        text = re.sub(r"https://static\.xfree\.com/[^\s\"'<>]+\.js",
+                      _static_js, text)
         def _static(m):
             u = m.group(0)
             return base + "/static?u=" + urllib.parse.quote(u, safe="")
@@ -730,13 +742,16 @@ class Handler(BaseHTTPRequestHandler):
                 or not self.allowed(target):
             self.send_text(400, "bad or disallowed url")
             return
-        # v1.6: one retry on failure (a first-attempt hiccup must not
-        # blank a thumbnail that would load on the second try).
+        # v2.7: video keeps 2 attempts / 30s (a big stream must not
+        # die on one hiccup); img/static get 1 attempt / 12s — a
+        # slow icon must fail fast, never block the page boot.
+        timeout = 30 if _kind == "video" else 12
+        attempts = 2 if _kind == "video" else 1
         last_exc = None
-        for attempt in range(2):
+        for attempt in range(attempts):
             try:
                 with fetch_stream(target, self.upstream_headers(),
-                                 timeout=30) as resp:
+                                 timeout=timeout) as resp:
                     self.stream_response(resp)
                 return
             except urllib.error.HTTPError as exc:
@@ -744,7 +759,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             except Exception as exc:
                 last_exc = exc
-                time.sleep(1)
+                if attempt + 1 < attempts:
+                    time.sleep(1)
         self.send_text(502, "upstream failed: %s" % last_exc)
 
 
