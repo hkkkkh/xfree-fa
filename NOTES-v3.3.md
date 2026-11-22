@@ -6,13 +6,22 @@
 
 ## 1. Dubbing — root causes found (both fixed)
 (a) Translate dead on live Render: /dub/health showed translate_gtx FAIL
-(2x 10 s timeouts) while STT/TTS were OK. Render's shared egress IP is
-blocked/timed-out on translate.googleapis.com gtx. Fix: translate chain
-in proxy/dub.py (v1.1) — gtx on translate.googleapis.com, then gtx on
-translate.google.com, then MyMemory (no key); a failed host is skipped
-for 60 s; /dub/health probes each candidate and reports which works.
-Gemini ruled out: the key lives in Muse's secure vault and cannot be
-put on Render.
+(2x 10 s timeouts in v3.2) while STT/TTS were OK. First fix (chain:
+gtx-apis -> gtx-com -> MyMemory) did NOT fix it live: on Render 3.3
+ALL three failed fast (328-499 ms). Proven cause: Google 302s BOTH
+gtx hosts to /sorry/index from Render's shared egress IP ("unusual
+traffic" block) — IP-based, no code path avoids it; and MyMemory
+WITHOUT de= 429s (anonymous 5,000 chars/day per shared IP exhausted).
+Real fix (dub 1.2): MyMemory WITH de=xfree-fa@example.com (documented
+50,000 chars/day; de is only a quota key, no account) — verified from
+this VM: 200 «سلام دنیا». From Render the chain now in practice runs
+on MyMemory. Also fixed: quotaFinished is checked at the TOP level
+of the MyMemory response (code had looked inside responseData).
+Rejected after live testing 2026-11-22: Bing ttranslatev3 (205 even
+with fresh IG token), DeepL jsonrpc ("older version" reject), Edge
+translator + LibreTranslate argos (timeouts), AllOrigins->gtx (522),
+SimplyTranslate (empty), Lingva (disconnected), Gemini (key in
+secure vault, cannot go on Render).
 (b) App bug: after turning dubbing off once, hookVideo() returned false
 for the already-hooked video element (video.__xfDubHooked) and the
 button said "دوبله در دسترس نیست" forever. Fix: already-hooked returns
