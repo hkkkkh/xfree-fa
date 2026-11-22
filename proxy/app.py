@@ -9,7 +9,7 @@ in Iran, so the phone cannot reach them directly with VPN off. The phone
 talks ONLY to this service (onrender.com) and this service — running
 outside Iran — fetches the bytes and streams them back.
 
-Endpoints (all GET):
+Endpoints (all GET unless noted):
   /                  health check -> "ok"
   /page?path=/...    site page HTML, fetched via Jina Reader server-side
                      (&format=md -> Markdown instead of HTML)
@@ -17,6 +17,14 @@ Endpoints (all GET):
   /video?u=<mp4 url>    video file, streamed from cdn.xfree.com with
                      HTTP Range passthrough (206), so VideoView seeking
                      and DownloadManager resume work.
+  POST /auth         v2.3 JSON relay for login/signup: body
+                     {"url": "https://www.xfree.com/api/...", "body": {...}}
+                     -> {"status": <upstream code>, "body": "<text>"}
+                     Only xfree.com / www.xfree.com are allowed.
+  POST /upload?url=<upload host>   v2.3 raw relay for video uploads:
+                     forwards the multipart body + Content-Type +
+                     Authorization to upload.xfree.com and returns the
+                     upstream status/body. Only upload.xfree.com allowed.
 
 Security: only these hosts are allowed (anything else -> 403), so the
 proxy cannot be abused as an open proxy:
@@ -60,7 +68,7 @@ ALLOWED_HOSTS = {
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-PROXY_VERSION = "1.9"
+PROXY_VERSION = "2.3"
 
 # v1.9: 900s TTL — the keep-alive pings /page every 12 min, so the
 # cache must outlive the ping interval or the home page is cold again.
@@ -162,6 +170,111 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         self.handle_all()
+
+    def do_POST(self):
+        # v2.3 POST relays (login + upload). The phone cannot reach
+        # xfree.com directly in Iran; these forward the request from
+        # outside Iran and return the REAL upstream status/body.
+        # Nothing here invents a success: a failed upstream is
+        # reported with its real code.
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length > 64 * 1024 * 1024:
+            self.send_text(413, "body too large")
+            return
+        raw = self.rfile.read(length) if length > 0 else b""
+
+        if parsed.path == "/auth":
+            self.handle_auth(raw)
+            return
+        if parsed.path == "/upload":
+            self.handle_upload(query, raw)
+            return
+        self.send_text(404, "not found")
+
+    def handle_auth(self, raw):
+        """POST /auth {"url": ..., "body": {...}} -> upstream JSON POST.
+        Only xfree.com / www.xfree.com targets are allowed."""
+        try:
+            import json
+            payload = json.loads(raw.decode("utf-8"))
+            target = payload.get("url") or ""
+            body = payload.get("body") or {}
+        except Exception as exc:
+            self.send_text(400, "bad json: %s" % exc)
+            return
+        host = urllib.parse.urlparse(target).hostname or ""
+        if host not in ("www.xfree.com", "xfree.com") \
+                or not target.startswith("https://"):
+            self.send_text(403, "disallowed auth target")
+            return
+        try:
+            import json
+            req = urllib.request.Request(
+                target,
+                data=json.dumps(body).encode("utf-8"),
+                headers={"User-Agent": UA,
+                         "Content-Type": "application/json",
+                         "Accept": "application/json"},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                upstream_body = resp.read(20000).decode("utf-8", "replace")
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            upstream_body = exc.read(20000).decode("utf-8", "replace")
+            status = exc.code
+        except Exception as exc:
+            self.send_text(502, "upstream failed: %s" % exc)
+            return
+        import json
+        out = json.dumps({"status": status, "body": upstream_body})
+        self.send_text(200, out, "application/json; charset=utf-8")
+
+    def handle_upload(self, query, raw):
+        """POST /upload?url=<target> — forward a raw multipart body to
+        upload.xfree.com, return the upstream status + body verbatim."""
+        target = (query.get("url") or [""])[0]
+        host = urllib.parse.urlparse(target).hostname or ""
+        if host != "upload.xfree.com" or not target.startswith("https://"):
+            self.send_text(403, "disallowed upload target")
+            return
+        headers = {"User-Agent": UA}
+        ctype = self.headers.get("Content-Type")
+        if ctype:
+            headers["Content-Type"] = ctype
+        auth = self.headers.get("Authorization")
+        if auth:
+            headers["Authorization"] = auth
+        try:
+            req = urllib.request.Request(target, data=raw,
+                                         headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                body = resp.read(20000)
+                self.send_response(resp.status)
+                self.send_header("Content-Type",
+                                 resp.headers.get("Content-Type",
+                                                  "text/plain; charset=utf-8"))
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-Proxy-Version", PROXY_VERSION)
+                self.end_headers()
+                self.wfile.write(body)
+                return
+        except urllib.error.HTTPError as exc:
+            body = exc.read(20000)
+            self.send_response(exc.code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Proxy-Version", PROXY_VERSION)
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        except Exception as exc:
+            self.send_text(502, "upstream failed: %s" % exc)
+            return
 
     def handle_all(self):
         parsed = urllib.parse.urlparse(self.path)
