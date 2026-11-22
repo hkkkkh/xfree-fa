@@ -171,7 +171,7 @@ RELAY_HOSTS = {
 # old references fail loudly instead of silently reappearing.
 TRANSLATE_INJECT = ""
 
-PROXY_VERSION = "3.9"
+PROXY_VERSION = "3.10"
 PROXY_BASE = "https://xfree-fa-proxy.onrender.com"
 
 # v3.2: every spelling of the two OAuth callback URLs that can
@@ -215,6 +215,13 @@ _PAGE_CACHE_LOCK = threading.Lock()
 CHUNK = 2 * 1024 * 1024  # v3.2: 2 MB writes for video streaming
                       # (was 1 MB — fewer write syscalls per MB
                       # on the 0.1-CPU Render free instance)
+
+# v3.10 (ChatGPT priority 1): video Range streams are written in
+# 64 KB chunks — the first bytes reach the player ~0.05 s after
+# the upstream responds instead of after a full 2 MB read, so a
+# slow phone starts playback sooner. The body is NEVER read into
+# memory whole: pool_stream + stream_response_pooled stream it.
+VIDEO_CHUNK = 64 * 1024
 
 # ----------------------------------------------------------------------
 # v3.0: keep-alive upstream connection pool.
@@ -562,7 +569,7 @@ class Handler(BaseHTTPRequestHandler):
         broken = False
         try:
             while True:
-                chunk = resp.read(CHUNK)
+                chunk = resp.read(VIDEO_CHUNK)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
@@ -1353,6 +1360,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_binary(self, query, _kind):
         target = (query.get("u") or [""])[0]
+        # v3.10: unwrap a double-wrapped relay URL ONCE. The app's
+        # v3.9 SubtitleEngine wrapped an already-proxied /video?u=
+        # URL a second time, so the target host was the proxy
+        # itself — not in ALLOWED_HOSTS — and the proxy answered
+        # 400 "bad or disallowed url". That 400 was the whole
+        # "audio cannot be captured" subtitle failure (the mp4
+        # DOES have an audio track; ffprobe proves it). One unwrap
+        # only, then the normal allowed() check runs on the inner
+        # URL, so no new host is ever smuggled in. The proxy's own
+        # host is PROXY_BASE's hostname plus the Host header this
+        # request arrived on (so it also works on a local dev
+        # instance, not just on Render).
+        try:
+            _pt = urllib.parse.urlparse(target)
+            _own = {urllib.parse.urlparse(PROXY_BASE).hostname}
+            _host_hdr = (self.headers.get("Host") or "").split(":")[0]
+            if _host_hdr:
+                _own.add(_host_hdr)
+            if _pt.hostname in _own:
+                _inner = urllib.parse.parse_qs(
+                    _pt.query).get("u", [""])[0]
+                if _inner.startswith("https://"):
+                    target = _inner
+        except Exception:
+            pass
         if not target or not target.startswith("https://") \
                 or not self.allowed(target):
             self.send_text(400, "bad or disallowed url")

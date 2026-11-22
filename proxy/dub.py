@@ -91,7 +91,36 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-DUB_VERSION = "1.8"
+DUB_VERSION = "1.9"
+
+# v3.10 instrumentation (ChatGPT priority 3): counters for every
+# step of the subtitle chain, exposed via /dub/health ("stats") so
+# a break can be located without guessing. The app's "configured:
+# true" only means the env var exists; these counters show what
+# actually flowed: audio packets/bytes received, Gemini messages,
+# transcripts, STT calls, subtitle messages sent.
+_STATS = {
+    "ws_audio_packets": 0,   # binary PCM frames received (both WS paths)
+    "ws_audio_bytes": 0,
+    "ws_stt_calls": 0,       # google_stt calls from /dub/ws workers
+    "ws_stt_empty": 0,       # ... that returned empty text
+    "http_stt_calls": 0,     # POST /dub/stt calls
+    "gemini_sessions": 0,    # Gemini Live sessions that completed setup
+    "gemini_messages": 0,    # messages received from Gemini Live
+    "gemini_transcripts": 0,  # outputTranscription (Persian) parsed
+    "gemini_input_transcripts": 0,  # inputTranscription (source lang)
+    "gemini_errors": 0,      # gemini_error / gemini_closed sent to app
+    "subtitles_sent": 0,     # final/interim caption messages sent
+}
+_STATS_LOCK = threading.Lock()
+
+
+def _stat(name, n=1):
+    try:
+        with _STATS_LOCK:
+            _STATS[name] = _STATS.get(name, 0) + n
+    except Exception:
+        pass
 
 # v3.9 (2026-11-22) — subtitle root-cause fixes, proved live:
 #  (a) /dub/ws returned EMPTY STT for every window on live Render
@@ -899,6 +928,7 @@ def dub_segment(pcm, t0=0.0, want_tts=True):
 def stt_only(pcm, t0=0.0):
     """One ~2 s PCM chunk -> {source_text, source_lang, ...}.
     STT only: no translate, no TTS. Never raises."""
+    _stat("http_stt_calls")
     t_start = time.time()
     timings = {}
     if len(pcm) > SEGMENT_MAX_SECONDS * SEGMENT_SAMPLE_RATE * 2:
@@ -1012,9 +1042,21 @@ def dub_health():
     with _HEALTH_LOCK:
         if (_HEALTH_CACHE["data"] is not None
                 and time.time() - _HEALTH_CACHE["at"] < 60):
-            return _HEALTH_CACHE["data"]
+            # v3.10 FIX: the probes are cached for 60 s (they are
+            # slow), but the stats snapshot must NEVER be cached —
+            # the whole point of the counters is live diagnosis.
+            # Before this fix, a health call cached the stats and
+            # every later call within 60 s returned the stale
+            # snapshot, which made a working WS path look dead
+            # (counters frozen at 0 while captions were flowing).
+            data = dict(_HEALTH_CACHE["data"])
+            data["stats"] = dict(_STATS)
+            return data
         data = {
             "dub_version": DUB_VERSION,
+            # v3.10: live counters — where the subtitle chain
+            # actually breaks (see _STATS above).
+            "stats": dict(_STATS),
             "services": {
                 "stt_google_v2": _probe("stt", _probe_stt),
                 "translate": _probe("translate", _probe_translate),
@@ -1085,6 +1127,12 @@ def handle_dub(handler):
         # v3.9: a real Gemini request from this server (see
         # gemini_test): raw HTTP status + error, never the key.
         body = json.dumps(gemini_test(),
+                          ensure_ascii=False).encode("utf-8")
+        _send_json(handler, 200, body)
+        return True
+    if parsed.path == "/dub/gemini-diag" and handler.command == "GET":
+        # v3.10: live Gemini Live WS handshake + setup probe.
+        body = json.dumps(gemini_diag(),
                           ensure_ascii=False).encode("utf-8")
         _send_json(handler, 200, body)
         return True
@@ -1312,6 +1360,7 @@ def handle_dub_ws(handler):
             return
         if _pcm_rms(pcm) < SILENCE_RMS:
             return  # silent: skip, never invent
+        _stat("ws_stt_calls")
         try:
             text, conf = google_stt(pcm, "en-US")
         except Exception as exc:  # noqa: BLE001 - report, never crash
@@ -1326,6 +1375,8 @@ def handle_dub_ws(handler):
                "text": text})
         src = "en"
         if text == "":
+            _stat("ws_stt_empty")
+            _stat("ws_stt_calls")
             try:
                 text, conf = google_stt(pcm, "fa-IR")
             except Exception as exc:  # noqa: BLE001
@@ -1358,9 +1409,11 @@ def handle_dub_ws(handler):
                     _send({"type": kind, "t0": round(t0, 2), "dur": dur,
                            "text": fa, "lang": "fa",
                            "conf": round(conf, 2)})
+                    _stat("subtitles_sent")
                     return
         _send({"type": kind, "t0": round(t0, 2), "dur": dur,
                "text": text, "lang": src, "conf": round(conf, 2)})
+        _stat("subtitles_sent")
 
     def _feed(pcm_bytes):
         """Append PCM; fire interim at 0.5 s, final at 1.0 s."""
@@ -1433,6 +1486,8 @@ def handle_dub_ws(handler):
                     pass
                 continue
             if op == 0x2 and payload:  # binary PCM s16le 16 kHz mono
+                _stat("ws_audio_packets")
+                _stat("ws_audio_bytes", len(payload))
                 # v3.6.1: _feed MUST be inside try/except — it used
                 # to sit outside the loop's try, so any exception
                 # here (e.g. a worker-submit failure) killed the
@@ -1569,25 +1624,85 @@ def gemini_test():
                 "detail": ""}
 
 
+def gemini_diag():
+    """v3.10: prove the Gemini Live relay works from THIS server,
+    without a phone. Opens the Gemini WS, sends the setup, waits
+    up to 12 s for setupComplete. Returns the stage reached and a
+    safe error string — never the key, never response bodies."""
+    if not gemini_configured():
+        return {"ok": False, "stage": "not_configured",
+                "error": "GEMINI_API_KEY is not set on the server"}
+    gsock = None
+    try:
+        path = (_GEMINI_WS_PATH + "?key="
+                + urllib.parse.quote(gemini_key(), safe=""))
+        gsock = _ws_connect(_GEMINI_HOST, path,
+                            {"x-goog-api-key": gemini_key()},
+                            timeout=15, safe_error=True)
+        gsock.settimeout(12)
+        _ws_send_text(gsock, json.dumps(_GEMINI_SETUP))
+        end = time.time() + 12
+        while time.time() < end:
+            try:
+                op, payload = _ws_recv_frame(gsock)
+            except socket.timeout:
+                continue
+            if op in (0x1, 0x2) and payload:
+                try:
+                    m = json.loads(payload.decode("utf-8"))
+                except Exception:
+                    continue
+                if isinstance(m, dict) and "setupComplete" in m:
+                    return {"ok": True, "stage": "setup_complete",
+                            "error": None}
+                if isinstance(m, dict) and "error" in m:
+                    err = m.get("error") or {}
+                    detail = err.get("message", err) \
+                        if isinstance(err, dict) else str(err)
+                    return {"ok": False, "stage": "gemini_error",
+                            "error": "%s" % detail}
+        return {"ok": False, "stage": "setup_timeout",
+                "error": "no setupComplete within 12 s"}
+    except Exception as exc:
+        return {"ok": False, "stage": "handshake_failed",
+                "error": "%s" % type(exc).__name__}
+    finally:
+        if gsock is not None:
+            try:
+                gsock.close()
+            except Exception:
+                pass
+
+
 def _gemini_parse_out(text):
-    """Extract (fa_text, turn_complete) from one Gemini Live JSON
-    message. Returns (None, False) when the message carries no
-    output transcription."""
+    """Extract (text, turn_complete, lang) from one Gemini Live JSON
+    message. Primary: serverContent.outputTranscription (Persian,
+    lang "fa"). Fallback: serverContent.inputTranscription (the
+    source-language transcript, lang "en") — the phone then
+    translates it on-phone instead of showing nothing. Returns
+    (None, False, "en") when the message carries no transcript.
+    v3.10: the old version only read outputTranscription, so a
+    session that only ever produced inputTranscription looked
+    completely dead from the outside."""
     try:
         msg = json.loads(text)
     except Exception:
-        return None, False
+        return None, False, "en"
     if not isinstance(msg, dict):
-        return None, False
+        return None, False, "en"
     sc = msg.get("serverContent") or {}
     if not isinstance(sc, dict):
-        return None, False
+        return None, False, "en"
+    done = bool(sc.get("turnComplete"))
     ot = sc.get("outputTranscription") or {}
     fa = ot.get("text") if isinstance(ot, dict) else None
-    done = bool(sc.get("turnComplete"))
     if fa:
-        return str(fa), done
-    return None, done
+        return str(fa), done, "fa"
+    it = sc.get("inputTranscription") or {}
+    src = it.get("text") if isinstance(it, dict) else None
+    if src:
+        return str(src), done, "en"
+    return None, done, "en"
 
 
 def handle_dub_gemini_ws(handler):
@@ -1668,9 +1783,11 @@ def handle_dub_gemini_ws(handler):
         gsock.settimeout(30)
         if not got_setup:
             raise RuntimeError("gemini setup not completed")
+        _stat("gemini_sessions")
     except Exception:
         # Generic error only — never the exception text (it could
         # carry server response bytes) and never the key.
+        _stat("gemini_errors")
         _send({"type": "error", "error": "gemini_error"})
         try:
             _ws_send_frame(sock, send_lock, b"", opcode=0x8)
@@ -1728,23 +1845,33 @@ def handle_dub_gemini_ws(handler):
                     text = payload.decode("utf-8")
                 except Exception:
                     continue
-                fa, done = _gemini_parse_out(text)
+                _stat("gemini_messages")
+                fa, done, lang = _gemini_parse_out(text)
                 if not fa:
                     continue
                 fa = fa.strip()
                 if not fa or fa == state["last_sent"]:
                     continue  # dedup: same line twice
                 state["last_sent"] = fa
+                if lang == "fa":
+                    _stat("gemini_transcripts")
+                else:
+                    # Source-language transcript only: forward it
+                    # as lang "en" so the phone translates it
+                    # on-phone instead of showing nothing.
+                    _stat("gemini_input_transcripts")
                 if done:
                     norm = " ".join(fa.lower().split())
                     if norm == state["last_final"]:
                         continue
                     state["last_final"] = norm
                     _send({"type": "final", "t0": round(
-                        state["mark_t0"], 2), "text": fa, "lang": "fa"})
+                        state["mark_t0"], 2), "text": fa, "lang": lang})
+                    _stat("subtitles_sent")
                 else:
                     _send({"type": "interim", "t0": round(
-                        state["mark_t0"], 2), "text": fa, "lang": "fa"})
+                        state["mark_t0"], 2), "text": fa, "lang": lang})
+                    _stat("subtitles_sent")
         except Exception:
             pass
         finally:
@@ -1796,6 +1923,8 @@ def handle_dub_gemini_ws(handler):
                     pass
                 continue
             if op == 0x2 and payload:  # binary PCM s16le 16 kHz mono
+                _stat("ws_audio_packets")
+                _stat("ws_audio_bytes", len(payload))
                 try:
                     # _ws_send_text does a single sendall with no
                     # internal lock, so serialise it here.
