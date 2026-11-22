@@ -162,32 +162,16 @@ RELAY_HOSTS = {
     "content.xfree.com", "mtm.ntl.cloud",
 }
 
-# v3.1: Google Translate Element bootstrap, injected into every HTML
-# page the reverse proxy serves, so the site renders in Persian
-# (fa) like the user's Chrome-translated browser view. The site has
-# NO fa locale of its own, so without this the app can only show
-# English. Progressive enhancement: if Google is unreachable the
-# script simply never translates and the page stays English.
-TRANSLATE_INJECT = (
-    '<style>.goog-te-banner-frame{display:none!important}'
-    '.goog-te-gadget{display:none!important}'
-    'body{top:0!important}</style>'
-    '<div id="google_translate_element" style="display:none"></div>'
-    '<script>function xfGoogleTranslateInit(){try{'
-    'new google.translate.TranslateElement('
-    '{pageLanguage:"en",includedLanguages:"fa",autoDisplay:false},'
-    '"google_translate_element");'
-    'var n=0;var t=setInterval(function(){n++;'
-    'var s=document.querySelector(".goog-te-combo");'
-    'if(s){s.value="fa";s.dispatchEvent(new Event("change"));'
-    'clearInterval(t);}else if(n>30){clearInterval(t);}},500);'
-    '}catch(e){}}</script>'
-    '<script async src="https://xfree-fa-proxy.onrender.com/g/'
-    'translate.google.com/translate_a/element.js'
-    '?cb=xfGoogleTranslateInit"></script>'
-)
+# v3.6: Google Translate Element injection REMOVED (user correction
+# 2026-11-22, screenshot 1000300657): it produced the Chrome
+# translate bar/popup the user rejected — subtitles must be the
+# bottom-of-video caption overlay only, never page translation.
+# The site now shows in its own language; Persian comes only from
+# the subtitle overlay. The constant is kept as an empty string so
+# old references fail loudly instead of silently reappearing.
+TRANSLATE_INJECT = ""
 
-PROXY_VERSION = "3.5"
+PROXY_VERSION = "3.6"
 PROXY_BASE = "https://xfree-fa-proxy.onrender.com"
 
 # v3.2: every spelling of the two OAuth callback URLs that can
@@ -1163,18 +1147,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self.send_text(502, "upstream blocked (challenge page)")
                 return
-        # v3.1: Persian UI. The site has NO fa locale, so the
-        # Persian screen in the user's browser is Chrome's page
-        # translation. Inject Google Translate Element (auto fa)
-        # into HTML pages so the app shows the site in Persian too.
-        # Only for anonymous HTML pages served by the reverse proxy
-        # (never API JSON, never relayed Google/Apple pages).
-        if (method == "GET" and status == 200
-                and ctype.startswith("text/html")
-                and b"</body>" in body):
-            body = body.replace(b"</body>",
-                                TRANSLATE_INJECT.encode("utf-8")
-                                + b"</body>", 1)
+        # v3.6: Translate Element injection REMOVED (user correction
+        # 2026-11-22): it produced the Chrome translate bar/popup
+        # the user rejected. Subtitles are the bottom-of-video
+        # caption overlay only — never page translation.
         if cache_key is not None and status == 200:
             if ctype.startswith("text/html") and not looks_like_page(body):
                 pass  # never cache a challenge page

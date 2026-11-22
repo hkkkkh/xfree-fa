@@ -91,7 +91,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-DUB_VERSION = "1.4"
+DUB_VERSION = "1.5"
 
 # v3.4: DUBBING IS DEAD — the app is subtitles-only now (user order).
 # Root cause of dead translate: Render's SHARED egress IP is burned
@@ -1025,6 +1025,10 @@ def handle_dub(handler):
     audio/l16, t0 in query) OR JSON {"pcm_b64": ..., "t0": ...}.
     Returns True if this request was a /dub/* route."""
     parsed = urllib.parse.urlparse(handler.path)
+    if parsed.path == "/dub/ws" and handler.command == "GET":
+        # v3.6: WebSocket live subtitles (streaming transport).
+        handle_dub_ws(handler)
+        return True
     if parsed.path == "/dub/health" and handler.command == "GET":
         body = json.dumps(dub_health(), ensure_ascii=False).encode("utf-8")
         _send_json(handler, 200, body)
@@ -1123,6 +1127,211 @@ def handle_dub(handler):
             result, ensure_ascii=False).encode("utf-8"))
         return True
     return False
+
+
+# ======================================================================
+# v3.6 WebSocket live subtitles: GET /dub/ws (upgrade).
+#
+# Why WebSocket: the HTTP POST /dub/stt path paid a fresh request
+# (TLS already warm, but a full HTTP round-trip + headers) per 2 s
+# chunk, and chunks were processed strictly in series. The WS keeps
+# ONE persistent connection: the app streams 16 kHz s16le PCM as
+# binary frames, the server STTs 1.0 s windows (0.5 s interim
+# windows) in a 2-worker pool concurrently, and sends back JSON:
+#   {"type":"final","t0":<video seconds>,"dur":1.0,
+#    "text":...,"lang":"en"|"fa","conf":0.98}
+#   {"type":"interim","t0":...,"dur":0.5,"text":...,"lang":...}
+#   {"type":"error","error":"stt failed"}
+# Translation still happens ON THE PHONE (Render's egress IP is
+# burned for gtx/MyMemory) — the WS only does STT. Timestamps are
+# precise: the client sends {"op":"mark","t0":<video.currentTime>}
+# once at start; each window's t0 = mark + audio seconds consumed.
+#
+# True streaming STT (Google streaming API) is NOT free without a
+# key, so this is the closest real thing: 1 s windows + 0.5 s
+# interim windows over a persistent socket, concurrent STT. No
+# subtitle is ever invented: silent windows are skipped, empty STT
+# sends nothing. Audio Playback Capture (MediaProjection) is NOT
+# used: it captures OTHER apps' audio and needs a system consent
+# dialog the user never approved; our video plays inside our own
+# WebView, so the app's JS AudioContext capture (no permission
+# needed) is the correct path. Pure stdlib; no new dependency.
+# ======================================================================
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_WS_CHUNK_SAMPLES = 16000   # 1.0 s final window at 16 kHz
+_WS_HALF_SAMPLES = 8000     # 0.5 s interim window
+_WS_MAX_IDLE = 90           # close a dead connection after 90 s
+
+
+def _ws_send_frame(sock, lock, payload, opcode=0x1):
+    """One unmasked server text frame (opcode 0x1) or binary (0x2)."""
+    data = payload if isinstance(payload, bytes) else payload.encode("utf-8")
+    header = bytearray([0x80 | opcode])
+    n = len(data)
+    if n < 126:
+        header.append(n)
+    elif n < 65536:
+        header.append(126)
+        header += struct.pack(">H", n)
+    else:
+        header.append(127)
+        header += struct.pack(">Q", n)
+    with lock:
+        sock.sendall(bytes(header) + data)
+
+
+def _ws_send_json(sock, lock, obj):
+    _ws_send_frame(sock, lock, json.dumps(obj, ensure_ascii=False))
+
+
+def _ws_recv_exact(sock, n):
+    out = b""
+    while len(out) < n:
+        chunk = sock.recv(n - len(out))
+        if not chunk:
+            raise EOFError("websocket closed")
+        out += chunk
+    return out
+
+
+def _ws_recv_frame(sock):
+    """One client frame. Returns (opcode, payload bytes).
+    Client frames are always masked (RFC 6455)."""
+    h = _ws_recv_exact(sock, 2)
+    op = h[0] & 0x0F
+    ln = h[1] & 0x7F
+    if ln == 126:
+        ln = struct.unpack(">H", _ws_recv_exact(sock, 2))[0]
+    elif ln == 127:
+        ln = struct.unpack(">Q", _ws_recv_exact(sock, 8))[0]
+    mask = _ws_recv_exact(sock, 4) if h[1] & 0x80 else None
+    payload = _ws_recv_exact(sock, ln) if ln else b""
+    if mask:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return op, payload
+
+
+def handle_dub_ws(handler):
+    """WebSocket upgrade + streaming STT loop. Runs inside the
+    handler thread until the client closes or 90 s idle."""
+    import concurrent.futures as _futures
+
+    key = handler.headers.get("Sec-WebSocket-Key") or ""
+    accept = base64.b64encode(hashlib.sha1(
+        (key + _WS_GUID).encode("ascii")).digest()).decode("ascii")
+    handler.send_response(101, "Switching Protocols")
+    handler.send_header("Upgrade", "websocket")
+    handler.send_header("Connection", "Upgrade")
+    handler.send_header("Sec-WebSocket-Accept", accept)
+    handler.end_headers()
+    sock = handler.connection
+    sock.settimeout(5)
+    send_lock = threading.Lock()
+    executor = _futures.ThreadPoolExecutor(max_workers=2)
+    state = {"pcm": bytearray(), "samples": 0, "mark_t0": 0.0,
+             "interim_sent": False, "last_final": "",
+             "closed": False, "last_rx": time.time()}
+
+    def _send(obj):
+        if state["closed"]:
+            return
+        try:
+            _ws_send_json(sock, send_lock, obj)
+        except Exception:
+            state["closed"] = True
+
+    def _run_stt(pcm, t0, dur, kind):
+        """STT one window in a worker; send interim/final JSON."""
+        if state["closed"]:
+            return
+        if _pcm_rms(pcm) < SILENCE_RMS:
+            return  # silent: skip, never invent
+        text, conf = google_stt(pcm, "en-US")
+        src = "en"
+        if text == "":
+            text, conf = google_stt(pcm, "fa-IR")
+            src = "fa"
+        if state["closed"] or text is None or text == "":
+            return
+        text = text.strip()
+        if kind == "final":
+            norm = " ".join(text.lower().split())
+            if norm == state["last_final"]:
+                return  # dedup: same words as the previous window
+            state["last_final"] = norm
+        _send({"type": kind, "t0": round(t0, 2), "dur": dur,
+               "text": text, "lang": src, "conf": round(conf, 2)})
+
+    def _feed(pcm_bytes):
+        """Append PCM; fire interim at 0.5 s, final at 1.0 s."""
+        state["pcm"] += pcm_bytes
+        state["samples"] = len(state["pcm"]) // 2
+        base_t0 = state["mark_t0"]
+        if (not state["interim_sent"]
+                and state["samples"] >= _WS_HALF_SAMPLES):
+            state["interim_sent"] = True
+            half = bytes(state["pcm"][:_WS_HALF_SAMPLES * 2])
+            executor.submit(_run_stt, half, base_t0, 0.5, "interim")
+        while state["samples"] >= _WS_CHUNK_SAMPLES:
+            chunk = bytes(state["pcm"][:_WS_CHUNK_SAMPLES * 2])
+            del state["pcm"][:_WS_CHUNK_SAMPLES * 2]
+            state["samples"] = len(state["pcm"]) // 2
+            win_t0 = base_t0
+            state["mark_t0"] = base_t0 + 1.0
+            state["interim_sent"] = False
+            executor.submit(_run_stt, chunk, win_t0, 1.0, "final")
+
+    try:
+        while not state["closed"]:
+            try:
+                op, payload = _ws_recv_frame(sock)
+            except socket.timeout:
+                if time.time() - state["last_rx"] > _WS_MAX_IDLE:
+                    break
+                # keep-alive ping every ~20 s of silence
+                try:
+                    _ws_send_frame(sock, send_lock, b"", opcode=0x9)
+                except Exception:
+                    break
+                continue
+            except (EOFError, OSError):
+                break
+            state["last_rx"] = time.time()
+            if op == 0x8:  # close
+                try:
+                    _ws_send_frame(sock, send_lock, payload, opcode=0x8)
+                except Exception:
+                    pass
+                break
+            if op == 0x9:  # ping -> pong
+                try:
+                    _ws_send_frame(sock, send_lock, payload, opcode=0xA)
+                except Exception:
+                    break
+                continue
+            if op == 0xA:  # pong
+                continue
+            if op == 0x1:  # text control: {"op":"mark","t0":12.3}
+                try:
+                    msg = json.loads(payload.decode("utf-8"))
+                    if msg.get("op") == "mark":
+                        state["mark_t0"] = float(msg.get("t0") or 0.0)
+                        state["pcm"] = bytearray()
+                        state["samples"] = 0
+                        state["interim_sent"] = False
+                except Exception:
+                    pass
+                continue
+            if op == 0x2 and payload:  # binary PCM s16le 16 kHz mono
+                _feed(payload)
+    finally:
+        state["closed"] = True
+        executor.shutdown(wait=False, cancel_futures=True)
+        try:
+            sock.close()
+        except Exception:
+            pass
+        handler.close_connection = True
 
 
 def _send_json(handler, code, body):
