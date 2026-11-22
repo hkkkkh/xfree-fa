@@ -1,6 +1,32 @@
 #!/usr/bin/env python3
 """XFreeFa proxy v3.1 — fast no-VPN backend for the Persian XFree app.
 
+v3.2 (2026-11-22):
+  * GOOGLE LOGIN FIX: googleURL/appleURL (the OAuth redirect_uri
+    the "Continue with Google/Apple" button sends) are NEVER
+    rewritten to the proxy origin. v3.1 rewrote them, so Google
+    rejected login with 400 redirect_uri_mismatch — proved live:
+    the proxy redirect_uri 302s to Google's /signin/oauth/error
+    (redirect_uri_mismatch, naming the proxy URL); the
+    www.xfree.com redirect_uri 302s to the Google sign-in page.
+    The callback itself still lands on the proxy (the /g/ relay
+    rewrites Google's Location to proxy-relative, and the app
+    intercepts any direct navigation there), so the callback
+    page stays same-origin and its postMessage reaches the login
+    modal (cross-origin messages are ignored by the modal).
+  * SPEED: pool acquire no longer spins up to 5s waiting for a
+    free slot under a ~30-request burst — an ephemeral connection
+    is opened at once instead (a fresh TLS handshake ~0.4s beats
+    waiting seconds). Video streaming chunks 1 MB -> 2 MB
+    (fewer write syscalls on the 0.1-CPU free instance). The
+    server was already threaded (ThreadingHTTPServer, backlog
+    128) — verified, no change needed there.
+  * APP (WebActivity.java): video detail pages prefetch the first
+    1 MB (unmetered networks only) and serve it from memory when
+    the player asks; OAuth callback navigations are intercepted
+    to the proxy; the login popup uses the same intercepting
+    client as the main WebView, so its cookies flow back.
+
 v3.1 (2026-11-22):
   * MOBILE LAYOUT: the proxy used to fetch the site with a DESKTOP
     Chrome UA, so the site served its DESKTOP layout (no hamburger,
@@ -159,8 +185,40 @@ TRANSLATE_INJECT = (
     '?cb=xfGoogleTranslateInit"></script>'
 )
 
-PROXY_VERSION = "3.1"
+PROXY_VERSION = "3.2"
 PROXY_BASE = "https://xfree-fa-proxy.onrender.com"
+
+# v3.2: every spelling of the two OAuth callback URLs that can
+# appear in served HTML/JS/JSON, with a placeholder each.
+# googleURL/appleURL in the site's Nuxt state ARE these URLs — the
+# redirect_uri the "Continue with Google/Apple" button sends to
+# Google/Apple. They must stay exactly
+# https://www.xfree.com/api/external/<google|apple> (registered in
+# xfree.com's OAuth clients). Longest/most specific forms first:
+# the "//..." form is a substring of the "https://..." form, so
+# protecting the full form first keeps protocol-relative hits real.
+_OAUTH_CALLBACK_PROTECT = [
+    ("https://www.xfree.com/api/external/google",
+     "__XF_OAUTH_GOOGLE_CB__"),
+    ("https://www.xfree.com/api/external/apple",
+     "__XF_OAUTH_APPLE_CB__"),
+    ("http://www.xfree.com/api/external/google",
+     "__XF_OAUTH_GOOGLE_CB_HTTP__"),
+    ("http://www.xfree.com/api/external/apple",
+     "__XF_OAUTH_APPLE_CB_HTTP__"),
+    ("//www.xfree.com/api/external/google",
+     "__XF_OAUTH_GOOGLE_CB_PROTO__"),
+    ("//www.xfree.com/api/external/apple",
+     "__XF_OAUTH_APPLE_CB_PROTO__"),
+    ("https:\\u002F\\u002Fwww.xfree.com\\u002Fapi\\u002Fexternal\\u002Fgoogle",
+     "__XF_OAUTH_GOOGLE_CB_ESC__"),
+    ("https:\\u002F\\u002Fwww.xfree.com\\u002Fapi\\u002Fexternal\\u002Fapple",
+     "__XF_OAUTH_APPLE_CB_ESC__"),
+    ("https:\\/\\/www.xfree.com\\/api\\/external\\/google",
+     "__XF_OAUTH_GOOGLE_CB_SLASH__"),
+    ("https:\\/\\/www.xfree.com\\/api\\/external\\/apple",
+     "__XF_OAUTH_APPLE_CB_SLASH__"),
+]
 
 # v1.9: 900s TTL — the keep-alive pings /page every 12 min, so the
 # cache must outlive the ping interval or the home page is cold again.
@@ -168,9 +226,9 @@ _PAGE_CACHE = {}  # (path, want_md) -> (body_bytes, content_type, at)
 _PAGE_CACHE_TTL = 900
 _PAGE_CACHE_LOCK = threading.Lock()
 
-CHUNK = 1024 * 1024  # v3.1: 1 MB writes for video streaming
-                      # (was 256 KB — more syscalls per MB on the
-                      # 0.1-CPU Render free instance)
+CHUNK = 2 * 1024 * 1024  # v3.2: 2 MB writes for video streaming
+                      # (was 1 MB — fewer write syscalls per MB
+                      # on the 0.1-CPU Render free instance)
 
 # ----------------------------------------------------------------------
 # v3.0: keep-alive upstream connection pool.
@@ -221,24 +279,25 @@ class ConnPool:
 
     def acquire(self, host, timeout):
         """Return (conn, slot). slot is None for an ephemeral conn
-        (created when all pooled slots are busy — closed after use)."""
-        deadline = time.time() + 5.0
-        while True:
-            with self._guard:
-                pool = self._pools.setdefault(host, [])
-                for slot in pool:
-                    if slot[1].acquire(blocking=False):
-                        return slot[0], slot
-                if len(pool) < self.MAX_PER_HOST:
-                    conn = self._new_conn(host, timeout)
-                    lock = threading.Lock()
-                    lock.acquire()
-                    slot = [conn, lock]
-                    pool.append(slot)
-                    return conn, slot
-            if time.time() > deadline:
-                return self._new_conn(host, timeout), None
-            time.sleep(0.02)
+        (created when all pooled slots are busy — closed after use).
+        v3.2: NO 5s spin waiting for a free slot. A page load fires
+        ~30 parallel subrequests against 6 pooled slots, so most
+        requests used to poll for up to 5s before getting an
+        ephemeral connection — a fresh TLS handshake (~0.4s) is
+        far cheaper than waiting seconds for a pooled slot."""
+        with self._guard:
+            pool = self._pools.setdefault(host, [])
+            for slot in pool:
+                if slot[1].acquire(blocking=False):
+                    return slot[0], slot
+            if len(pool) < self.MAX_PER_HOST:
+                conn = self._new_conn(host, timeout)
+                lock = threading.Lock()
+                lock.acquire()
+                slot = [conn, lock]
+                pool.append(slot)
+                return conn, slot
+        return self._new_conn(host, timeout), None
 
     def release(self, host, conn, slot, broken=False):
         if slot is None:
@@ -870,7 +929,16 @@ class Handler(BaseHTTPRequestHandler):
         or the WebView would navigate straight to the filtered site.
         v3.1: redirects to a relay host (e.g. Google's OAuth server
         redirecting to accounts.google.com) are rewritten to the
-        /g/<host>/ relay the same way."""
+        /g/<host>/ relay the same way.
+        v3.2: NOTE — this rewriting is INTENTIONAL for the OAuth
+        callback too: Google's 302 to
+        https://www.xfree.com/api/external/google?code=... becomes
+        the proxy-relative /api/external/google?code=..., so the
+        callback page loads on the proxy origin and its postMessage
+        to the login modal is same-origin (the modal ignores
+        cross-origin messages). The redirect_uri SENT to Google is
+        a different thing — that one must stay www.xfree.com and is
+        protected in _rewrite_body, never here."""
         if not loc:
             return loc
         for host in ("https://www.xfree.com", "https://xfree.com",
@@ -903,6 +971,15 @@ class Handler(BaseHTTPRequestHandler):
             return body
         base = PROXY_BASE
         esc = "https:\\u002F\\u002F"
+        # v3.2: protect the OAuth callback URLs BEFORE any rewrite
+        # runs (see _OAUTH_CALLBACK_PROTECT): googleURL/appleURL
+        # must stay https://www.xfree.com/api/external/... — the
+        # registered redirect_uri. v3.1 rewrote them to the proxy
+        # origin and Google rejected login with
+        # 400 redirect_uri_mismatch (proved live 2026-11-22).
+        # Restored at the end of this function.
+        for _orig, _ph in _OAUTH_CALLBACK_PROTECT:
+            text = text.replace(_orig, _ph)
         # v3.1: relay hosts — Google/Apple/Translate/GTM/Turnstile/
         # Matomo and content.xfree.com are called DIRECTLY by the
         # page and its login flows; in Iran they are filtered, so
@@ -963,6 +1040,10 @@ class Handler(BaseHTTPRequestHandler):
         text = text.replace("https://xfree.com", base)
         text = text.replace("//www.xfree.com", "//xfree-fa-proxy.onrender.com")
         text = text.replace("//xfree.com", "//xfree-fa-proxy.onrender.com")
+        # v3.2: restore the OAuth callback URLs untouched — they
+        # must reach the browser as https://www.xfree.com/...
+        for _orig, _ph in _OAUTH_CALLBACK_PROTECT:
+            text = text.replace(_ph, _orig)
         return text.encode("utf-8")
 
     def handle_reverse_proxy(self, parsed, raw=b"", content_type=None):
