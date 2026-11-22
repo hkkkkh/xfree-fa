@@ -229,9 +229,15 @@ class Handler(BaseHTTPRequestHandler):
                 or not target.startswith("https://"):
             self.send_text(403, "disallowed auth target")
             return
+        # v2.4: the site's axios request interceptor (6347c71.js) puts
+        # these headers on EVERY /api call: apiversion "1.0", language,
+        # country, plus the cookie. Without apiversion the API edge
+        # answers 404 "null" even for real paths.
         headers = {"User-Agent": UA,
                    "Content-Type": "application/json",
-                   "Accept": "application/json",
+                   "Accept": "application/json, text/plain, */*",
+                   "apiversion": "1.0",
+                   "language": "en",
                    "Origin": "https://www.xfree.com",
                    "Referer": "https://www.xfree.com/"}
         if cookies:
@@ -275,7 +281,10 @@ class Handler(BaseHTTPRequestHandler):
                 or not target.startswith("https://"):
             self.send_text(403, "disallowed auth target")
             return
-        headers = {"User-Agent": UA, "Accept": "application/json",
+        headers = {"User-Agent": UA,
+                   "Accept": "application/json, text/plain, */*",
+                   "apiversion": "1.0",
+                   "language": "en",
                    "Origin": "https://www.xfree.com",
                    "Referer": "https://www.xfree.com/"}
         cookies = self.headers.get("Cookie")
