@@ -1,5 +1,29 @@
 #!/usr/bin/env python3
-"""XFreeFa proxy v3.0 — fast no-VPN backend for the Persian XFree app.
+"""XFreeFa proxy v3.1 — fast no-VPN backend for the Persian XFree app.
+
+v3.1 (2026-11-22):
+  * MOBILE LAYOUT: the proxy used to fetch the site with a DESKTOP
+    Chrome UA, so the site served its DESKTOP layout (no hamburger,
+    no mobile bottom nav, no top carousel, wide grid) — the app on a
+    phone showed a different site than the user's browser. Now the
+    client's real User-Agent is forwarded (mobile WebView UA), so the
+    site serves its MOBILE layout. Page cache is keyed by UA class.
+  * VIDEO: Range streams now use the pooled keep-alive connection to
+    cdn.xfree.com (was: a fresh TLS handshake per Range request via
+    urllib) with 1 MB chunks (was 256 KB).
+  * GOOGLE/APPLE LOGIN: all OAuth/asset hosts are relayed under /g/
+    (accounts.google.com, oauth2.googleapis.com, apis.google.com,
+    ssl/fonts.gstatic.com, translate.google.com, appleid.*, ...)
+    because they load DIRECT in the WebView and are filtered in Iran.
+  * PERSIAN UI: the site has NO fa locale (11 languages: en/de/es/
+    fr/it/pt/cs/pl/ko/ja/zh — verified via /api/settings), so the
+    Persian screen in the user's browser is Chrome's page
+    translation. The proxy now injects Google Translate Element
+    (auto fa) into HTML pages, so the app shows the site in Persian
+    like the user's translated browser view.
+  * /upload 404 and /settings 302->/login are the SITE's own answers
+    for anonymous users, not proxy gaps (verified live).
+
 
 Runs on Render free tier (or anywhere with Python 3, zero dependencies —
 only the standard library, so there is nothing to pip-install).
@@ -89,7 +113,53 @@ ALLOWED_HOSTS = {
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-PROXY_VERSION = "3.0"
+# v3.1: fallback UA when the client sends none — the user's phone
+# (Redmi Note 13, mobile Chrome). The proxy forwards the CLIENT's
+# real UA whenever one is present (see Handler.client_ua).
+MOBILE_UA = ("Mozilla/5.0 (Linux; Android 14; Redmi Note 13) "
+             "AppleWebKit/537.36 (KHTML, like Gecko) "
+             "Chrome/131.0.0.0 Mobile Safari/537.36")
+
+# v3.1: external hosts the site (and its login flows) call DIRECTLY
+# in the browser. They are filtered in Iran, so the proxy relays
+# them under /g/<host>/<path> and rewrites their URLs in pages.
+RELAY_HOSTS = {
+    "accounts.google.com", "oauth2.googleapis.com",
+    "www.googleapis.com", "apis.google.com",
+    "ssl.gstatic.com", "fonts.gstatic.com",
+    "www.google.com", "lh3.googleusercontent.com",
+    "translate.google.com", "translate.googleapis.com",
+    "www.googletagmanager.com", "challenges.cloudflare.com",
+    "appleid.cdn-apple.com", "appleid.apple.com", "idmsa.apple.com",
+    "content.xfree.com", "mtm.ntl.cloud",
+}
+
+# v3.1: Google Translate Element bootstrap, injected into every HTML
+# page the reverse proxy serves, so the site renders in Persian
+# (fa) like the user's Chrome-translated browser view. The site has
+# NO fa locale of its own, so without this the app can only show
+# English. Progressive enhancement: if Google is unreachable the
+# script simply never translates and the page stays English.
+TRANSLATE_INJECT = (
+    '<style>.goog-te-banner-frame{display:none!important}'
+    '.goog-te-gadget{display:none!important}'
+    'body{top:0!important}</style>'
+    '<div id="google_translate_element" style="display:none"></div>'
+    '<script>function xfGoogleTranslateInit(){try{'
+    'new google.translate.TranslateElement('
+    '{pageLanguage:"en",includedLanguages:"fa",autoDisplay:false},'
+    '"google_translate_element");'
+    'var n=0;var t=setInterval(function(){n++;'
+    'var s=document.querySelector(".goog-te-combo");'
+    'if(s){s.value="fa";s.dispatchEvent(new Event("change"));'
+    'clearInterval(t);}else if(n>30){clearInterval(t);}},500);'
+    '}catch(e){}}</script>'
+    '<script src="https://xfree-fa-proxy.onrender.com/g/'
+    'translate.google.com/translate_a/element.js'
+    '?cb=xfGoogleTranslateInit"></script>'
+)
+
+PROXY_VERSION = "3.1"
 PROXY_BASE = "https://xfree-fa-proxy.onrender.com"
 
 # v1.9: 900s TTL — the keep-alive pings /page every 12 min, so the
@@ -98,8 +168,9 @@ _PAGE_CACHE = {}  # (path, want_md) -> (body_bytes, content_type, at)
 _PAGE_CACHE_TTL = 900
 _PAGE_CACHE_LOCK = threading.Lock()
 
-CHUNK = 256 * 1024  # v1.4: fewer, bigger writes = faster streaming
-                      # through the 0.1-CPU Render free instance
+CHUNK = 1024 * 1024  # v3.1: 1 MB writes for video streaming
+                      # (was 256 KB — more syscalls per MB on the
+                      # 0.1-CPU Render free instance)
 
 # ----------------------------------------------------------------------
 # v3.0: keep-alive upstream connection pool.
@@ -259,6 +330,35 @@ def pool_request(host, method, path, headers, body=None, timeout=15):
     raise last_exc
 
 
+def pool_stream(host, method, path, headers, timeout=30):
+    """Like pool_request but STREAMING: returns
+    (status, headers, resp, token). The caller streams resp.read()
+    itself and then calls release_stream(token, broken=...).
+    Video Range requests used to open a FRESH TLS connection to
+    cdn.xfree.com per request via urllib (0.4-0.7s handshake each,
+    and the player fires many Range requests) — that was the video
+    lag. A pooled connection answers in ~0.1s. Retries once on a
+    stale pooled connection."""
+    headers = dict(headers)
+    headers["Accept-Encoding"] = "identity"  # never gzip video
+    last_exc = None
+    for _attempt in range(2):
+        conn, slot = POOL.acquire(host, timeout)
+        try:
+            conn.request(method, path, headers=headers)
+            resp = conn.getresponse()
+            return resp.status, resp.getheaders(), resp, (host, conn, slot)
+        except Exception as exc:
+            last_exc = exc
+            POOL.release(host, conn, slot, broken=True)
+    raise last_exc
+
+
+def release_stream(token, broken=False):
+    host, conn, slot = token
+    POOL.release(host, conn, slot, broken=broken)
+
+
 # ----------------------------------------------------------------------
 # v3.0: response cache for anonymous GETs.
 # The homepage / playlist / search HTML is identical for every logged-out
@@ -343,6 +443,18 @@ class Handler(BaseHTTPRequestHandler):
         print("proxy:", fmt % args, flush=True)
 
     # -- helpers ---------------------------------------------------------
+    def client_ua(self):
+        """v3.1: forward the CLIENT's real User-Agent upstream. The
+        proxy used to send a hardcoded DESKTOP Chrome UA, so the site
+        served its desktop layout (no hamburger, no mobile bottom
+        nav, no top carousel) even though the app runs on a phone.
+        The WebView sends a mobile UA; forwarding it makes the site
+        serve its mobile layout — the exact screen in the user's
+        screenshot. Falls back to a mobile UA when the client sent
+        none (curl, keep-alive pings)."""
+        ua = self.headers.get("User-Agent") or ""
+        return ua if ua.startswith("Mozilla/") else MOBILE_UA
+
     def send_text(self, code, body, ctype="text/plain; charset=utf-8"):
         data = body.encode("utf-8")
         self.send_response(code)
@@ -382,8 +494,46 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass  # client (player) stopped / seeked away — normal
 
+    def stream_response_pooled(self, resp, token):
+        """Stream a pooled http.client response (video Range) to the
+        client, then release the pooled connection. v3.1: the old
+        video path used urllib (fresh TLS per Range request); pooled
+        streaming reuses the cdn connection and writes 1 MB chunks.
+        A client that stops early marks the slot broken so the next
+        request gets a fresh connection."""
+        status = resp.status
+        self.send_response(status)
+        for name in ("Content-Type", "Content-Length", "Content-Range",
+                     "Accept-Ranges", "Cache-Control", "Content-Disposition"):
+            value = resp.headers.get(name)
+            if value:
+                self.send_header(name, value)
+        self.send_header("X-Proxy-Version", PROXY_VERSION)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        if self.command == "HEAD":
+            release_stream(token, broken=False)
+            return
+        broken = False
+        try:
+            while True:
+                chunk = resp.read(CHUNK)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            broken = True  # player stopped / seeked away — normal
+        except Exception:
+            broken = True
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            release_stream(token, broken=broken)
+
     def upstream_headers(self, extra=None):
-        headers = {"User-Agent": UA}
+        headers = {"User-Agent": self.client_ua()}
         for name in ("Range", "If-Range"):
             value = self.headers.get(name)
             if value:
@@ -418,6 +568,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         raw = self.rfile.read(length) if length > 0 else b""
 
+        if parsed.path.startswith("/g/"):
+            self.handle_generic_relay(parsed, raw,
+                                      self.headers.get("Content-Type"))
+            return
         if parsed.path == "/auth":
             self.handle_auth(raw)
             return
@@ -458,6 +612,10 @@ class Handler(BaseHTTPRequestHandler):
             length = 0
         raw = self.rfile.read(length) if length > 0 else b""
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/g/"):
+            self.handle_generic_relay(parsed, raw,
+                                      self.headers.get("Content-Type"))
+            return
         if parsed.path.startswith("/x-scraper/"):
             self.handle_host_relay("scraper.xfree.com", "/x-scraper",
                                    parsed, raw,
@@ -480,7 +638,7 @@ class Handler(BaseHTTPRequestHandler):
         target = rest
         if parsed.query:
             target += "?" + parsed.query
-        headers = {"User-Agent": UA}
+        headers = {"User-Agent": self.client_ua()}
         for name in ("Accept", "Accept-Language", "Range", "If-Range"):
             value = self.headers.get(name)
             if value:
@@ -524,6 +682,29 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+
+    def handle_generic_relay(self, parsed, raw, content_type):
+        """v3.1: /g/<host>/<path> — relay for the external hosts the
+        site and its login flows call directly (Google OAuth/GSI,
+        Apple ID, Translate, GTM, Turnstile, Matomo, content.xfree).
+        They are filtered in Iran; the relay fetches them from
+        outside Iran and returns status/headers/body verbatim (with
+        Location and in-body URLs rewritten to stay on the proxy).
+        Only allowlisted hosts (RELAY_HOSTS) — never an open proxy.
+        NOTE (honest limit): cookies Google sets with
+        Domain=.google.com are dropped by the browser because the
+        page origin is the proxy, not google.com; host-only cookies
+        do stick. The redirect (popup) OAuth flow does not depend on
+        those cookies, but Google OneTap may refuse the proxy origin
+        — only the user's own login test can prove the full flow."""
+        rest = parsed.path[3:]  # strip "/g/"
+        host = rest.split("/", 1)[0]
+        if host not in RELAY_HOSTS:
+            self.send_text(403, "disallowed relay host")
+            return
+        self.handle_host_relay(host, "/g/" + host, parsed, raw,
+                               content_type)
+
     def handle_auth(self, raw):
         """POST /auth {"url": ..., "body": {...}, "cookies": "...",
         "origin": "...", "referer": "..."} -> upstream JSON POST.
@@ -554,7 +735,7 @@ class Handler(BaseHTTPRequestHandler):
         # these headers on EVERY /api call: apiversion "1.0", language,
         # country, plus the cookie. Without apiversion the API edge
         # answers 404 "null" even for real paths.
-        headers = {"User-Agent": UA,
+        headers = {"User-Agent": self.client_ua(),
                    "Content-Type": "application/json",
                    "Accept": "application/json, text/plain, */*",
                    "apiversion": "1.0",
@@ -596,7 +777,7 @@ class Handler(BaseHTTPRequestHandler):
                 or not target.startswith("https://"):
             self.send_text(403, "disallowed auth target")
             return
-        headers = {"User-Agent": UA,
+        headers = {"User-Agent": self.client_ua(),
                    "Accept": "application/json, text/plain, */*",
                    "apiversion": "1.0",
                    "language": "en",
@@ -629,7 +810,7 @@ class Handler(BaseHTTPRequestHandler):
         if host != "upload.xfree.com" or not target.startswith("https://"):
             self.send_text(403, "disallowed upload target")
             return
-        headers = {"User-Agent": UA}
+        headers = {"User-Agent": self.client_ua()}
         ctype = self.headers.get("Content-Type")
         if ctype:
             headers["Content-Type"] = ctype
@@ -671,7 +852,8 @@ class Handler(BaseHTTPRequestHandler):
                                 if parsed_t.query else "")
         try:
             status, resp_headers, _body = pool_request(
-                host, "GET", path, {"User-Agent": UA}, timeout=30)
+                host, "GET", path, {"User-Agent": self.client_ua()},
+                timeout=30)
             headers = dict(resp_headers)
             set_cookie = _header_all(resp_headers, "Set-Cookie")
         except Exception as exc:
@@ -685,7 +867,10 @@ class Handler(BaseHTTPRequestHandler):
     # -- v2.6 reverse proxy (whole site through this origin) ---------
     def _rewrite_location(self, loc):
         """A redirect to www.xfree.com must stay on this proxy origin,
-        or the WebView would navigate straight to the filtered site."""
+        or the WebView would navigate straight to the filtered site.
+        v3.1: redirects to a relay host (e.g. Google's OAuth server
+        redirecting to accounts.google.com) are rewritten to the
+        /g/<host>/ relay the same way."""
         if not loc:
             return loc
         for host in ("https://www.xfree.com", "https://xfree.com",
@@ -693,6 +878,11 @@ class Handler(BaseHTTPRequestHandler):
                      "//www.xfree.com", "//xfree.com"):
             if loc.startswith(host):
                 return loc[len(host):] or "/"
+        for scheme in ("https://", "http://", "//"):
+            for host in RELAY_HOSTS:
+                prefix = scheme + host
+                if loc.startswith(prefix):
+                    return "/g/" + host + loc[len(prefix):]
         return loc
 
     def _rewrite_body(self, body, ctype):
@@ -713,6 +903,18 @@ class Handler(BaseHTTPRequestHandler):
             return body
         base = PROXY_BASE
         esc = "https:\\u002F\\u002F"
+        # v3.1: relay hosts — Google/Apple/Translate/GTM/Turnstile/
+        # Matomo and content.xfree.com are called DIRECTLY by the
+        # page and its login flows; in Iran they are filtered, so
+        # their URLs are rewritten to the /g/<host>/ relay (plain,
+        # protocol-relative and \u002F-escaped forms).
+        for _h in sorted(RELAY_HOSTS):
+            text = text.replace("https://" + _h, base + "/g/" + _h)
+            text = text.replace("//" + _h,
+                                "//xfree-fa-proxy.onrender.com/g/" + _h)
+            text = text.replace(esc + _h,
+                                esc + "xfree-fa-proxy.onrender.com"
+                                "\\u002Fg\\u002F" + _h)
         # v3.0: the Nuxt config sends the browser straight to
         # scraper.xfree.com and upload.xfree.com/media-api — both
         # filtered in Iran, so upload/scraper would silently fail.
@@ -795,13 +997,17 @@ class Handler(BaseHTTPRequestHandler):
                         or path.startswith("/video"):
                     cache_ttl = max(cache_ttl, 120)
             if cache_ttl > 0:
-                cache_key = (method, target_path)
+                # v3.1: mobile and desktop SSR differ — never serve
+                # a cached desktop page to a phone (or vice versa).
+                _ua = self.client_ua()
+                _cls = "m" if ("Mobile" in _ua or "Android" in _ua) else "d"
+                cache_key = (method, target_path, _cls)
                 hit = _cache_get(cache_key)
                 if hit is not None:
                     _status, _hdrs, _body, _at, _ttl = hit
                     self._send_proxied(_status, _hdrs, _body, cache_hit=True)
                     return
-        headers = {"User-Agent": UA}
+        headers = {"User-Agent": self.client_ua()}
         for name in ("Accept", "Accept-Language", "Range", "If-Range"):
             value = self.headers.get(name)
             if value:
@@ -845,7 +1051,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 req = urllib.request.Request(
                     jina_url,
-                    headers={"User-Agent": UA,
+                    headers={"User-Agent": self.client_ua(),
                              "X-Return-Format": "html"},
                     method="GET")
                 with urllib.request.urlopen(req, timeout=15) as resp:
@@ -862,6 +1068,18 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self.send_text(502, "upstream blocked (challenge page)")
                 return
+        # v3.1: Persian UI. The site has NO fa locale, so the
+        # Persian screen in the user's browser is Chrome's page
+        # translation. Inject Google Translate Element (auto fa)
+        # into HTML pages so the app shows the site in Persian too.
+        # Only for anonymous HTML pages served by the reverse proxy
+        # (never API JSON, never relayed Google/Apple pages).
+        if (method == "GET" and status == 200
+                and ctype.startswith("text/html")
+                and b"</body>" in body):
+            body = body.replace(b"</body>",
+                                TRANSLATE_INJECT.encode("utf-8")
+                                + b"</body>", 1)
         if cache_key is not None and status == 200:
             if ctype.startswith("text/html") and not looks_like_page(body):
                 pass  # never cache a challenge page
@@ -939,6 +1157,11 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_reverse_proxy(parsed)
             return
 
+        # v3.1: generic relay for Google/Apple/Translate/etc.
+        if parsed.path.startswith("/g/"):
+            self.handle_generic_relay(parsed, b"", None)
+            return
+
         # v3.0: scraper / upload relays (GET side; POST/PUT/DELETE
         # are routed in do_POST/_do_write_method).
         if parsed.path.startswith("/x-scraper/"):
@@ -978,7 +1201,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_text(400, "path must start with /")
             return
         want_md = (query.get("format") or [""])[0] == "md"
-        cache_key = (path, want_md)
+        _ua = self.client_ua()
+        _cls = "m" if ("Mobile" in _ua or "Android" in _ua) else "d"
+        cache_key = (path, want_md, _cls)
         with _PAGE_CACHE_LOCK:
             hit = _PAGE_CACHE.get(cache_key)
             if hit is not None and time.time() - hit[2] < _PAGE_CACHE_TTL:
@@ -1001,7 +1226,7 @@ class Handler(BaseHTTPRequestHandler):
         t_start = time.time()
         direct = "https://www.xfree.com" + path
         try:
-            with fetch_stream(direct, {"User-Agent": UA},
+            with fetch_stream(direct, {"User-Agent": self.client_ua()},
                              timeout=10) as resp:
                 candidate = resp.read()
             upstream_info.append("direct:%s:%.1fs"
@@ -1065,7 +1290,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     status, resp_headers, body = pool_request(
                         "www.xfree.com", "GET", "/_nuxt/" + name,
-                        {"User-Agent": UA,
+                        {"User-Agent": self.client_ua(),
                          "Accept": self.headers.get("Accept") or "*/*"},
                         timeout=15)
                 except Exception as exc:
@@ -1086,25 +1311,30 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(body)
                 return
         if _kind == "video":
-            # Long-lived Range stream: dedicated connection (pool
-            # slots must not be held for a whole playback).
-            timeout = 30
-            attempts = 2
+            # v3.1: Range stream over a POOLED keep-alive connection
+            # to cdn.xfree.com. The old urllib path paid a fresh
+            # TCP+TLS handshake per Range request (0.4-0.7s each) and
+            # the player fires many Range requests — that was the
+            # stutter. The slot is released when the stream ends.
+            parsed_t = urllib.parse.urlparse(target)
+            host = parsed_t.hostname
+            path = parsed_t.path + (("?" + parsed_t.query)
+                                    if parsed_t.query else "")
             last_exc = None
-            for attempt in range(attempts):
+            for attempt in range(2):
+                token = None
                 try:
-                    with fetch_stream(target, self.upstream_headers(),
-                                     timeout=timeout) as resp:
-                        self.stream_response(resp)
-                    return
-                except urllib.error.HTTPError as exc:
-                    self.send_text(exc.code or 502,
-                                   "upstream error %s" % exc.code)
+                    _st, _hdrs, resp, token = pool_stream(
+                        host, "GET", path, self.upstream_headers(),
+                        timeout=30)
+                    self.stream_response_pooled(resp, token)
                     return
                 except Exception as exc:
                     last_exc = exc
-                    if attempt + 1 < attempts:
-                        time.sleep(1)
+                    if token is not None:
+                        release_stream(token, broken=True)
+                    if attempt == 0:
+                        time.sleep(0.5)
             self.send_text(502, "upstream failed: %s" % last_exc)
             return
         # v3.0: thumbs + static icons via the pooled connection
