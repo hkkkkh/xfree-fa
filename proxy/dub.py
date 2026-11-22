@@ -91,7 +91,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-DUB_VERSION = "1.5"
+DUB_VERSION = "1.6"
 
 # v3.4: DUBBING IS DEAD — the app is subtitles-only now (user order).
 # Root cause of dead translate: Render's SHARED egress IP is burned
@@ -1264,6 +1264,16 @@ def handle_dub_ws(handler):
 
     def _feed(pcm_bytes):
         """Append PCM; fire interim at 0.5 s, final at 1.0 s."""
+        if not state.get("fed"):
+            # Diagnostic, sent synchronously from the handler thread
+            # (like the pong): proves the binary path is reached.
+            # The app ignores unknown message types.
+            state["fed"] = True
+            try:
+                _ws_send_json(sock, send_lock,
+                              {"type": "debug", "event": "feed-start"})
+            except Exception:
+                pass
         state["pcm"] += pcm_bytes
         state["samples"] = len(state["pcm"]) // 2
         base_t0 = state["mark_t0"]
@@ -1323,7 +1333,23 @@ def handle_dub_ws(handler):
                     pass
                 continue
             if op == 0x2 and payload:  # binary PCM s16le 16 kHz mono
-                _feed(payload)
+                # v3.6.1: _feed MUST be inside try/except — it used
+                # to sit outside the loop's try, so any exception
+                # here (e.g. a worker-submit failure) killed the
+                # handler thread silently: the client saw the 101
+                # and the pong, then total silence, no STT, no
+                # keep-alive pings (proved live 2026-11-22). The
+                # error is now reported to the client instead.
+                try:
+                    _feed(payload)
+                except Exception as exc:  # noqa: BLE001 - report it
+                    try:
+                        _ws_send_json(sock, send_lock, {
+                            "type": "error",
+                            "error": "feed failed: %s" % exc})
+                    except Exception:
+                        pass
+                    break
     finally:
         state["closed"] = True
         executor.shutdown(wait=False, cancel_futures=True)
