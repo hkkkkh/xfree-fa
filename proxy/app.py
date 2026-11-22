@@ -342,6 +342,38 @@ class Handler(BaseHTTPRequestHandler):
             self.send_text(502, "upstream failed: %s" % exc)
             return
 
+    def handle_diag(self, query):
+        """GET /diag?url=https://www.xfree.com/... — diagnostic only:
+        returns the upstream status + response headers (incl.
+        Set-Cookie) without the body. Used to learn exactly what the
+        site sets on a page load, so the app can reproduce the site's
+        own boot sequence instead of guessing it."""
+        target = (query.get("url") or [""])[0]
+        host = urllib.parse.urlparse(target).hostname or ""
+        if host not in ("www.xfree.com", "xfree.com") \
+                or not target.startswith("https://"):
+            self.send_text(403, "disallowed diag target")
+            return
+        try:
+            req = urllib.request.Request(
+                target, headers={"User-Agent": UA}, method="GET")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                status = resp.status
+                headers = dict(resp.headers.items())
+                set_cookie = resp.headers.get_all("Set-Cookie") or []
+                resp.read(1)
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            headers = dict(exc.headers.items())
+            set_cookie = exc.headers.get_all("Set-Cookie") or []
+        except Exception as exc:
+            self.send_text(502, "upstream failed: %s" % exc)
+            return
+        import json
+        out = json.dumps({"status": status, "headers": headers,
+                          "setCookie": set_cookie})
+        self.send_text(200, out, "application/json; charset=utf-8")
+
     def handle_all(self):
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
@@ -352,6 +384,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/auth":
             self.handle_auth_get(query)
+            return
+
+        if parsed.path == "/diag":
+            self.handle_diag(query)
             return
 
         if parsed.path == "/page":
