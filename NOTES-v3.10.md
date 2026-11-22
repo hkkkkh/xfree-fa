@@ -148,8 +148,17 @@ FIN) for both WS handlers and the Gemini reader. The dead duplicate
 **Local proof with manually fragmented frames:** 64 KB sent as 4096-byte
 fragments → reassembled into 1 packet / 64,000 bytes, STT finals
 "hello this is" / "short", Persian captions «سلام این است» / «کوتاه».
-Live re-verification (32 KB frame → +32,000 bytes; full Gemini streaming
-test) is in the final report.
+**Live re-verification (2026-11-22 ~16:15, commit `91525cfb`):**
+one 32,000-byte frame → **+32,000 bytes** (was +4,096); full streaming
+test (9 s clip × 3): **40 captions, first Persian «سلام، این یک» at
++1.8 s** (was 4 captions, first at +6.9 s, only «فقط»), full accurate
+transcription ("Hello, this is a short test of the subtitle system, the
+quick brown fox jumps over the lazy dog…") with good Persian
+(«سلام، این یک تست کوتاه از سیستم زیرنویس است، روباه قهوه‌ای سریع از
+روی سگ تنبل می‌پرد…»); live stats `ws_audio_bytes: 900,608`
+(= 868,608 sent + 32,000 controlled test — ALL bytes arrive),
+`gemini_transcripts: 20`, `subtitles_sent: 40`. The relay was starving;
+now it hears everything.
 
 Local proxy (port 10099, same code as pushed):
 - Range 0-65535 / 65536-131071 / 1048576-2097151 → all 206, correct

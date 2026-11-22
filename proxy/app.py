@@ -550,9 +550,10 @@ class Handler(BaseHTTPRequestHandler):
         """Stream a pooled http.client response (video Range) to the
         client, then release the pooled connection. v3.1: the old
         video path used urllib (fresh TLS per Range request); pooled
-        streaming reuses the cdn connection and writes 1 MB chunks.
-        A client that stops early marks the slot broken so the next
-        request gets a fresh connection."""
+        streaming reuses the cdn connection and writes 64 KB chunks
+        (v3.10: VIDEO_CHUNK, down from 1 MB, so first bytes reach the
+        player sooner). A client that stops early marks the slot
+        broken so the next request gets a fresh connection."""
         status = resp.status
         self.send_response(status)
         for name in ("Content-Type", "Content-Length", "Content-Range",
