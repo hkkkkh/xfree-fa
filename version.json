@@ -1,6 +1,1 @@
-{
-  "apkUrl": "https://github.com/hkkkkh/xfree-fa/releases/download/v3.10/xfree-fa-3.10.apk",
-  "notes": "نسخه ۳٫۱۰: ویدیو از ریشه درست شد — مسابقه/پیش‌خوانی/ریدایرکت حذف شد، پخش فقط از سرور؛ زیرنویس از ریشه درست شد — آدرس ویدیو دیگر دوبار پیچیده نمی‌شود و صدا واقعاً خوانده می‌شود",
-  "versionCode": 31,
-  "versionName": "3.10"
-}
+{"apkUrl":"https://github.com/hkkkkh/xfree-fa/releases/download/v3.11/xfree-fa-3.11.apk","notes":"نسخه ۳٫۱۱: سایت از ریشه درست شد — اول سرور بیدار می‌شه بعد سایت میاد، با دکمه تلاش دوباره؛ ویدیو و زیرنویس با لاگ کامل و راه جایگزین HTTP","versionCode":32,"versionName":"3.11"}

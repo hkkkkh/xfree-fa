@@ -91,7 +91,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-DUB_VERSION = "1.9"
+DUB_VERSION = "2.0"
 
 # v3.10 instrumentation (ChatGPT priority 3): counters for every
 # step of the subtitle chain, exposed via /dub/health ("stats") so
@@ -111,6 +111,11 @@ _STATS = {
     "gemini_input_transcripts": 0,  # inputTranscription (source lang)
     "gemini_errors": 0,      # gemini_error / gemini_closed sent to app
     "subtitles_sent": 0,     # final/interim caption messages sent
+    "ws_connects": 0,        # WS upgrades accepted (both WS paths)
+    "ws_disconnects": 0,     # WS sessions ended
+    "gemini_audio_bytes": 0,  # PCM bytes forwarded to Gemini Live
+    "http_stt_fallback": 0,  # POST /dub/stt calls carrying seq/id
+                             # (HTTP-fallback chunks from the phone)
 }
 _STATS_LOCK = threading.Lock()
 
@@ -121,6 +126,36 @@ def _stat(name, n=1):
             _STATS[name] = _STATS.get(name, 0) + n
     except Exception:
         pass
+
+
+def _dlog(session, stage, extra=""):
+    """v3.11 stage log (ChatGPT #4): one line per subtitle-chain
+    stage, all sharing the phone's session id, so a dead subtitle
+    can be located in the Render logs without guessing:
+    WS_CONNECT / WS_HANDSHAKE_OK / WS_RECEIVED_AUDIO /
+    WS_AUDIO_BYTES / GEMINI_CONNECTED / GEMINI_AUDIO_SENT /
+    GEMINI_TRANSCRIPT_RECEIVED / WS_TRANSCRIPT_SENT /
+    WS_DISCONNECTED. The session id comes from the phone (?sid=)
+    when present, else a generated one."""
+    try:
+        print("dub: [%s] %s %s" % (session, stage, extra),
+              flush=True)
+    except Exception:
+        pass
+
+
+def _new_session(handler):
+    """Session id shared phone<->proxy: ?sid= from the phone when
+    present, else a fresh 12-hex id."""
+    try:
+        q = urllib.parse.parse_qs(
+            urllib.parse.urlparse(handler.path).query)
+        sid = (q.get("sid") or [""])[0].strip()
+        if sid:
+            return sid[:32]
+    except Exception:
+        pass
+    return secrets.token_hex(6)
 
 # v3.9 (2026-11-22) — subtitle root-cause fixes, proved live:
 #  (a) /dub/ws returned EMPTY STT for every window on live Render
@@ -1143,6 +1178,32 @@ def handle_dub(handler):
             t0 = float((query.get("t0") or ["0"])[0])
         except ValueError:
             t0 = 0.0
+        # v3.11: HTTP-fallback chunks carry the phone's session id
+        # + a per-session sequence number + a unique chunk id, so
+        # the phone log, the proxy log and the caption can be tied
+        # together, and a retried chunk is recognisable (same id).
+        # Fallback chunks (ChatGPT #5) are 4 s with 0.75 s overlap:
+        # start_ms/end_ms carry the original audio time, and prev
+        # carries the previous chunk's text as context. The keyless
+        # Web Speech v2 STT endpoint takes no context parameter, so
+        # prev is logged only (documented, not silently dropped).
+        sid = (query.get("sid") or ["-"])[0][:32]
+        seq = (query.get("seq") or ["-"])[0]
+        cid = (query.get("id") or ["-"])[0][:48]
+        start_ms = (query.get("start_ms") or ["-"])[0]
+        end_ms = (query.get("end_ms") or ["-"])[0]
+        prev = (query.get("prev") or [""])[0][:80]
+        if start_ms != "-":
+            try:
+                t0 = float(start_ms) / 1000.0
+            except ValueError:
+                pass
+        if seq != "-" or cid != "-":
+            _stat("http_stt_fallback")
+        print("dub: [stt sid=%s seq=%s id=%s] t0=%.1f "
+              "start_ms=%s end_ms=%s bytes=%d prev=%.40s"
+              % (sid, seq, cid, t0, start_ms, end_ms, len(raw),
+                 prev), flush=True)
         ctype = (handler.headers.get("Content-Type") or "")
         if "application/json" in ctype:
             try:
@@ -1348,18 +1409,25 @@ def handle_dub_ws(handler):
     key = handler.headers.get("Sec-WebSocket-Key") or ""
     accept = base64.b64encode(hashlib.sha1(
         (key + _WS_GUID).encode("ascii")).digest()).decode("ascii")
+    # v3.11: shared session id + stage logs (ChatGPT #4).
+    session = _new_session(handler)
+    _dlog(session, "WS_CONNECT", "path=/dub/ws")
     handler.send_response(101, "Switching Protocols")
     handler.send_header("Upgrade", "websocket")
     handler.send_header("Connection", "Upgrade")
     handler.send_header("Sec-WebSocket-Accept", accept)
     handler.end_headers()
+    _stat("ws_connects")
+    _dlog(session, "WS_HANDSHAKE_OK", "101")
     sock = handler.connection
     sock.settimeout(5)
     send_lock = threading.Lock()
     executor = _futures.ThreadPoolExecutor(max_workers=2)
     state = {"pcm": bytearray(), "samples": 0, "mark_t0": 0.0,
              "interim_sent": False, "last_final": "",
-             "closed": False, "last_rx": time.time()}
+             "closed": False, "last_rx": time.time(),
+             "audio_bytes": 0, "got_audio": False,
+             "disconnect": "unknown"}
 
     def _send(obj):
         if state["closed"]:
@@ -1472,17 +1540,26 @@ def handle_dub_ws(handler):
                 op, payload = _ws_recv_frame(sock)
             except socket.timeout:
                 if time.time() - state["last_rx"] > _WS_MAX_IDLE:
+                    state["disconnect"] = "idle-90s"
                     break
                 # keep-alive ping every ~20 s of silence
                 try:
                     _ws_send_frame(sock, send_lock, b"", opcode=0x9)
                 except Exception:
+                    state["disconnect"] = "ping-failed"
                     break
                 continue
             except (EOFError, OSError):
+                state["disconnect"] = "eof"
                 break
             state["last_rx"] = time.time()
             if op == 0x8:  # close
+                try:
+                    code = struct.unpack(">H", payload[:2])[0] \
+                        if len(payload) >= 2 else 0
+                except Exception:
+                    code = 0
+                state["disconnect"] = "client-close code=%d" % code
                 try:
                     _ws_send_frame(sock, send_lock, payload, opcode=0x8)
                 except Exception:
@@ -1510,6 +1587,16 @@ def handle_dub_ws(handler):
             if op == 0x2 and payload:  # binary PCM s16le 16 kHz mono
                 _stat("ws_audio_packets")
                 _stat("ws_audio_bytes", len(payload))
+                # v3.11 stage logs (ChatGPT #4).
+                state["audio_bytes"] += len(payload)
+                if not state["got_audio"]:
+                    state["got_audio"] = True
+                    _dlog(session, "WS_RECEIVED_AUDIO",
+                          "first=%d bytes" % len(payload))
+                elif state["audio_bytes"] // 200000 > (
+                        state["audio_bytes"] - len(payload)) // 200000:
+                    _dlog(session, "WS_AUDIO_BYTES",
+                          "total=%d" % state["audio_bytes"])
                 # v3.6.1: _feed MUST be inside try/except — it used
                 # to sit outside the loop's try, so any exception
                 # here (e.g. a worker-submit failure) killed the
@@ -1529,6 +1616,11 @@ def handle_dub_ws(handler):
                     break
     finally:
         state["closed"] = True
+        _stat("ws_disconnects")
+        _dlog(session, "WS_DISCONNECTED",
+              "reason=%s audio_bytes=%d" % (
+                  state.get("disconnect", "unknown"),
+                  state.get("audio_bytes", 0)))
         executor.shutdown(wait=False, cancel_futures=True)
         try:
             sock.close()
@@ -1733,17 +1825,24 @@ def handle_dub_gemini_ws(handler):
     key = handler.headers.get("Sec-WebSocket-Key") or ""
     accept = base64.b64encode(hashlib.sha1(
         (key + _WS_GUID).encode("ascii")).digest()).decode("ascii")
+    # v3.11: shared session id + stage logs (ChatGPT #4).
+    session = _new_session(handler)
+    _dlog(session, "WS_CONNECT", "path=/dub/gemini-ws")
     handler.send_response(101, "Switching Protocols")
     handler.send_header("Upgrade", "websocket")
     handler.send_header("Connection", "Upgrade")
     handler.send_header("Sec-WebSocket-Accept", accept)
     handler.end_headers()
+    _stat("ws_connects")
+    _dlog(session, "WS_HANDSHAKE_OK", "101")
     sock = handler.connection
     sock.settimeout(5)
     send_lock = threading.Lock()
     gsend_lock = threading.Lock()  # serialises writes to the Gemini socket
     state = {"closed": False, "last_rx": time.time(),
-             "mark_t0": 0.0, "last_final": "", "last_sent": ""}
+             "mark_t0": 0.0, "last_final": "", "last_sent": "",
+             "audio_bytes": 0, "got_audio": False,
+             "gemini_bytes": 0, "disconnect": "unknown"}
 
     def _send(obj):
         if state["closed"]:
@@ -1756,6 +1855,9 @@ def handle_dub_gemini_ws(handler):
     if not gemini_configured():
         # No key on the server yet — tell the app so it falls back
         # to the no-key path instead of hanging.
+        _stat("ws_disconnects")
+        _dlog(session, "WS_DISCONNECTED",
+              "reason=gemini_not_configured")
         _send({"type": "error", "error": "gemini_not_configured"})
         try:
             _ws_send_frame(sock, send_lock, b"", opcode=0x8)
@@ -1806,10 +1908,14 @@ def handle_dub_gemini_ws(handler):
         if not got_setup:
             raise RuntimeError("gemini setup not completed")
         _stat("gemini_sessions")
+        _dlog(session, "GEMINI_CONNECTED", "setup_complete")
     except Exception:
         # Generic error only — never the exception text (it could
         # carry server response bytes) and never the key.
         _stat("gemini_errors")
+        _stat("ws_disconnects")
+        _dlog(session, "WS_DISCONNECTED",
+              "reason=gemini-setup-failed")
         _send({"type": "error", "error": "gemini_error"})
         try:
             _ws_send_frame(sock, send_lock, b"", opcode=0x8)
@@ -1882,6 +1988,10 @@ def handle_dub_gemini_ws(handler):
                     # as lang "en" so the phone translates it
                     # on-phone instead of showing nothing.
                     _stat("gemini_input_transcripts")
+                # v3.11 stage logs (ChatGPT #4).
+                _dlog(session, "GEMINI_TRANSCRIPT_RECEIVED",
+                      "lang=%s done=%s text=%.40s"
+                      % (lang, done, fa))
                 if done:
                     norm = " ".join(fa.lower().split())
                     if norm == state["last_final"]:
@@ -1894,6 +2004,9 @@ def handle_dub_gemini_ws(handler):
                     _send({"type": "interim", "t0": round(
                         state["mark_t0"], 2), "text": fa, "lang": lang})
                     _stat("subtitles_sent")
+                _dlog(session, "WS_TRANSCRIPT_SENT",
+                      "type=%s lang=%s"
+                      % ("final" if done else "interim", lang))
         except Exception:
             pass
         finally:
@@ -1913,16 +2026,25 @@ def handle_dub_gemini_ws(handler):
                 op, payload = _ws_recv_frame(sock)
             except socket.timeout:
                 if time.time() - state["last_rx"] > _GEMINI_MAX_IDLE:
+                    state["disconnect"] = "idle-90s"
                     break
                 try:
                     _ws_send_frame(sock, send_lock, b"", opcode=0x9)
                 except Exception:
+                    state["disconnect"] = "ping-failed"
                     break
                 continue
             except (EOFError, OSError):
+                state["disconnect"] = "eof"
                 break
             state["last_rx"] = time.time()
             if op == 0x8:  # close
+                try:
+                    code = struct.unpack(">H", payload[:2])[0] \
+                        if len(payload) >= 2 else 0
+                except Exception:
+                    code = 0
+                state["disconnect"] = "client-close code=%d" % code
                 try:
                     _ws_send_frame(sock, send_lock, payload, opcode=0x8)
                 except Exception:
@@ -1947,6 +2069,12 @@ def handle_dub_gemini_ws(handler):
             if op == 0x2 and payload:  # binary PCM s16le 16 kHz mono
                 _stat("ws_audio_packets")
                 _stat("ws_audio_bytes", len(payload))
+                # v3.11 stage logs (ChatGPT #4).
+                state["audio_bytes"] += len(payload)
+                if not state["got_audio"]:
+                    state["got_audio"] = True
+                    _dlog(session, "WS_RECEIVED_AUDIO",
+                          "first=%d bytes" % len(payload))
                 try:
                     # _ws_send_text does a single sendall with no
                     # internal lock, so serialise it here.
@@ -1958,10 +2086,24 @@ def handle_dub_gemini_ws(handler):
                                     payload).decode("ascii"),
                             }},
                         }))
+                    _stat("gemini_audio_bytes", len(payload))
+                    state["gemini_bytes"] += len(payload)
+                    if state["gemini_bytes"] // 200000 > (
+                            state["gemini_bytes"]
+                            - len(payload)) // 200000:
+                        _dlog(session, "GEMINI_AUDIO_SENT",
+                              "total=%d" % state["gemini_bytes"])
                 except Exception:
+                    state["disconnect"] = "gemini-send-failed"
                     break
     finally:
         state["closed"] = True
+        _stat("ws_disconnects")
+        _dlog(session, "WS_DISCONNECTED",
+              "reason=%s audio_bytes=%d gemini_bytes=%d" % (
+                  state.get("disconnect", "unknown"),
+                  state.get("audio_bytes", 0),
+                  state.get("gemini_bytes", 0)))
         try:
             gsock.close()
         except Exception:

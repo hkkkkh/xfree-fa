@@ -120,6 +120,7 @@ import os
 import re
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -171,7 +172,7 @@ RELAY_HOSTS = {
 # old references fail loudly instead of silently reappearing.
 TRANSLATE_INJECT = ""
 
-PROXY_VERSION = "3.10"
+PROXY_VERSION = "3.11"
 PROXY_BASE = "https://xfree-fa-proxy.onrender.com"
 
 # v3.2: every spelling of the two OAuth callback URLs that can
@@ -221,7 +222,14 @@ CHUNK = 2 * 1024 * 1024  # v3.2: 2 MB writes for video streaming
 # the upstream responds instead of after a full 2 MB read, so a
 # slow phone starts playback sooner. The body is NEVER read into
 # memory whole: pool_stream + stream_response_pooled stream it.
-VIDEO_CHUNK = 64 * 1024
+VIDEO_CHUNK = 1024 * 1024  # v3.11: 1 MB streaming chunks (ChatGPT #5:
+# log the browser's real Range sizes first — the VIDEO log line does
+# that — then stream in 1-2 MB chunks. The browser's own Range
+# requests are forwarded verbatim upstream and never re-chunked;
+# this is only the proxy's read/write granularity. 1 MB halves the
+# write syscalls vs 64 KB on the 0.1-CPU free instance, and the
+# CDN->Render leg is fast enough that the first byte is not
+# measurably later. Was 64 KB in v3.10, 2 MB in v3.1.)
 
 # ----------------------------------------------------------------------
 # v3.0: keep-alive upstream connection pool.
@@ -546,14 +554,23 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass  # client (player) stopped / seeked away — normal
 
-    def stream_response_pooled(self, resp, token):
+    def stream_response_pooled(self, resp, token, log=None):
         """Stream a pooled http.client response (video Range) to the
         client, then release the pooled connection. v3.1: the old
         video path used urllib (fresh TLS per Range request); pooled
-        streaming reuses the cdn connection and writes 64 KB chunks
-        (v3.10: VIDEO_CHUNK, down from 1 MB, so first bytes reach the
-        player sooner). A client that stops early marks the slot
-        broken so the next request gets a fresh connection."""
+        streaming reuses the cdn connection and writes VIDEO_CHUNK
+        pieces (v3.11: 1 MB, ChatGPT #5 — back up from the v3.10
+        64 KB: fewer write syscalls on the 0.1-CPU free instance,
+        first byte not measurably later). A client that stops early
+        marks the slot broken so the next request gets a fresh
+        connection.
+        v3.11: `log` (dict, optional) carries the video-diagnosis
+        fields (request_id, Range, upstream status/timings). One
+        VIDEO log line is printed when the stream ends, so a stall
+        can be located: upstream vs downstream vs client disconnect.
+        The client can send its own request id as X-Request-Id and
+        the phone logs the same id — one id ties phone + proxy logs
+        together (ChatGPT #4)."""
         status = resp.status
         self.send_response(status)
         for name in ("Content-Type", "Content-Length", "Content-Range",
@@ -561,6 +578,8 @@ class Handler(BaseHTTPRequestHandler):
             value = resp.headers.get(name)
             if value:
                 self.send_header(name, value)
+        if log is not None and log.get("req_id"):
+            self.send_header("X-Request-Id", log["req_id"])
         self.send_header("X-Proxy-Version", PROXY_VERSION)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
@@ -568,12 +587,15 @@ class Handler(BaseHTTPRequestHandler):
             release_stream(token, broken=False)
             return
         broken = False
+        bytes_sent = 0
+        t_start = time.time()
         try:
             while True:
                 chunk = resp.read(VIDEO_CHUNK)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
+                bytes_sent += len(chunk)
         except (BrokenPipeError, ConnectionResetError):
             broken = True  # player stopped / seeked away — normal
         except Exception:
@@ -584,6 +606,21 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             release_stream(token, broken=broken)
+        if log is not None:
+            # v3.11 VIDEO diagnosis line (one per Range request).
+            print("VIDEO req=%s range=%s upstream=%s downstream=%s "
+                  "content_range=%s bytes_sent=%d upstream_ms=%d "
+                  "total_ms=%d client_disconnect=%s" % (
+                      log.get("req_id", "-"),
+                      log.get("range", "-"),
+                      log.get("upstream_status", "-"),
+                      status,
+                      resp.headers.get("Content-Range") or "-",
+                      bytes_sent,
+                      log.get("upstream_ms", -1),
+                      int((time.time() - t_start) * 1000)
+                      + log.get("upstream_ms", 0),
+                      "true" if broken else "false"), flush=True)
 
     def upstream_headers(self, extra=None):
         headers = {"User-Agent": self.client_ua()}
@@ -1425,18 +1462,36 @@ class Handler(BaseHTTPRequestHandler):
             # TCP+TLS handshake per Range request (0.4-0.7s each) and
             # the player fires many Range requests — that was the
             # stutter. The slot is released when the stream ends.
+            # v3.11: per-request VIDEO diagnosis (ChatGPT #4). The
+            # phone sends X-Request-Id on its probes and the player
+            # path; the same id is echoed back as a response header
+            # and printed in the VIDEO log line, so one id ties the
+            # phone log to the proxy log. upstream_ms = time to get
+            # the upstream response headers (pool + CDN); the
+            # stream itself is timed inside stream_response_pooled.
             parsed_t = urllib.parse.urlparse(target)
             host = parsed_t.hostname
             path = parsed_t.path + (("?" + parsed_t.query)
                                     if parsed_t.query else "")
+            req_id = (self.headers.get("X-Request-Id") or "").strip()
+            if not req_id:
+                req_id = uuid.uuid4().hex[:12]
+            vlog = {"req_id": req_id,
+                    "range": self.headers.get("Range") or "-",
+                    "upstream_status": "-",
+                    "upstream_ms": -1}
             last_exc = None
             for attempt in range(2):
                 token = None
                 try:
+                    t_up = time.time()
                     _st, _hdrs, resp, token = pool_stream(
                         host, "GET", path, self.upstream_headers(),
                         timeout=30)
-                    self.stream_response_pooled(resp, token)
+                    vlog["upstream_ms"] = int(
+                        (time.time() - t_up) * 1000)
+                    vlog["upstream_status"] = _st
+                    self.stream_response_pooled(resp, token, vlog)
                     return
                 except Exception as exc:
                     last_exc = exc
@@ -1444,6 +1499,9 @@ class Handler(BaseHTTPRequestHandler):
                         release_stream(token, broken=True)
                     if attempt == 0:
                         time.sleep(0.5)
+            print("VIDEO req=%s range=%s upstream=FAILED "
+                  "downstream=502 error=%s" % (
+                      req_id, vlog["range"], last_exc), flush=True)
             self.send_text(502, "upstream failed: %s" % last_exc)
             return
         # v3.0: thumbs + static icons via the pooled connection
