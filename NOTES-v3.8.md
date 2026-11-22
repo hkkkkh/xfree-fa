@@ -47,7 +47,7 @@ throughput. Three app-side causes found in the code:
   total 0.81–0.94 s. Honest limit: from the VM the proxy is already
   at the direct ceiling, so the race's win is only provable on the
   user's phone in Iran, where the two paths actually differ.
-- Proxy pushed (commit TBD), live `x-proxy-version: 3.8`.
+- Proxy pushed (commit `68382074`), live `x-proxy-version: 3.8`.
 
 ## Still needs the user's own test (VPN off, mobile data AND Wi-Fi)
 1. Open the app, open a video — it should start playing fast, with
