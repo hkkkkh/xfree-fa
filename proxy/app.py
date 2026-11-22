@@ -14,6 +14,7 @@ Endpoints (all GET unless noted):
   /page?path=/...    site page HTML, fetched via Jina Reader server-side
                      (&format=md -> Markdown instead of HTML)
   /img?u=<thumb url>    thumbnail image, streamed from thumbs.xfree.com
+  /static?u=<url>       v2.6 JS bundles / icons from static.xfree.com
   /video?u=<mp4 url>    video file, streamed from cdn.xfree.com with
                      HTTP Range passthrough (206), so VideoView seeking
                      and DownloadManager resume work.
@@ -82,6 +83,7 @@ ALLOWED_HOSTS = {
     "cdn.xfree.com",
     "www.xfree.com",
     "xfree.com",
+    "static.xfree.com",
     "r.jina.ai",
 }
 
@@ -456,6 +458,13 @@ class Handler(BaseHTTPRequestHandler):
             return base + "/video?u=" + urllib.parse.quote(u, safe="")
         text = re.sub(r"https://thumbs\.xfree\.com/[^\s\"'<>]+", _thumb, text)
         text = re.sub(r"https://cdn\.xfree\.com/[^\s\"'<>]+", _cdn, text)
+        # v2.6: the site's JS bundles + icons come from static.xfree.com
+        # (110 references on the homepage) — route them through the
+        # proxy too, or the site never boots in the WebView.
+        def _static(m):
+            u = m.group(0)
+            return base + "/static?u=" + urllib.parse.quote(u, safe="")
+        text = re.sub(r"https://static\.xfree\.com/[^\s\"'<>]+", _static, text)
         text = text.replace("https://www.xfree.com", base)
         text = text.replace("https://xfree.com", base)
         text = text.replace("//www.xfree.com", "//xfree-fa-proxy.onrender.com")
@@ -597,6 +606,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/img":
             self.handle_binary(query, "image")
+            return
+
+        if parsed.path == "/static":
+            # v2.6: JS bundles + icons from static.xfree.com.
+            self.handle_binary(query, "static")
             return
 
         if parsed.path == "/video":
