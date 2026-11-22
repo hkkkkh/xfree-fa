@@ -91,7 +91,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-DUB_VERSION = "1.2"
+DUB_VERSION = "1.3"
 
 # ----------------------------------------------------------------------
 # Tunables
@@ -110,6 +110,7 @@ TRANSLATE_CANDIDATE_TIMEOUTS = {
     "mymemory": 8,
 }
 _TRANSLATE_DOWN = {}  # candidate -> unix time of last failure
+_LAST_TRANSLATE_ERROR = {}  # candidate -> short error text (health diag)
 _LAST_TRANSLATE_ENGINE = None
 TTS_TIMEOUT = 30
 TTS_VOICE = "fa-IR-DilaraNeural"  # female default; see TTS_VOICE_FEMALE/MALE
@@ -635,11 +636,15 @@ def _translate_one(name, text, src, dst, timeout, force=False):
             out = _translate_mymemory(text, src, dst, timeout)
         else:
             return None
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - record, then report None
         out = None
+        _LAST_TRANSLATE_ERROR[name] = (
+            "%s: %s" % (type(exc).__name__, exc))[:120]
     if out:
         _TRANSLATE_DOWN.pop(name, None)
+        _LAST_TRANSLATE_ERROR.pop(name, None)
         return out
+    _LAST_TRANSLATE_ERROR.setdefault(name, "returned-no-text")
     _TRANSLATE_DOWN[name] = time.time()
     return None
 
@@ -891,7 +896,8 @@ def _probe_translate_one(name):
     out = _translate_one(
         name, "Hello", "en", "fa",
         TRANSLATE_CANDIDATE_TIMEOUTS[name], force=True)
-    return bool(out), (out or "")
+    detail = out or _LAST_TRANSLATE_ERROR.get(name, "")
+    return bool(out), detail
 
 
 def _probe_tts():
