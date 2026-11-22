@@ -126,7 +126,30 @@ binary, 512 MB RAM, stdlib-only Python proxy).
   Render-IP 429 is IP-specific, not universal. The app's translate chain
   (phone gtx → MyMemory → proxy) is unchanged.
 
-## Live verification (2026-11-22, this build)
+## 4. NEW — WebSocket continuation frames: the relay was losing 7/8 of the audio
+
+**Found during live verification of this build (2026-11-22 ~16:10).**
+A middlebox on the live path (Render/Cloudflare edge) splits any large
+WS frame into 4096-byte CONTINUATION frames (opcode 0x0). The relay's
+`_ws_recv_frame` returned only the first frame and silently dropped every
+continuation. **Proved live:** one 32,000-byte binary frame raised
+`ws_audio_bytes` by exactly **4,096** (a 1,000-byte frame by 1,000); over
+a 3-pass streaming test, 30 frames / 868,608 bytes sent arrived as 30
+packets / **115,200** bytes — 13% of the audio. Locally (loopback, no
+middlebox) frames are never split, which is why every local test passed
+and live subtitles starved: Gemini only ever heard the first 0.128 s of
+each 1 s audio chunk. This is very likely the real reason live subtitles
+never worked on the phone, even though the relay "worked" in probes.
+
+**Fix (proxy-only, no APK rebuild needed):** `_ws_recv_frame` now
+reassembles fragmented messages (first frame + continuation frames until
+FIN) for both WS handlers and the Gemini reader. The dead duplicate
+`_ws_recv_frame` (old version that discarded the mask bytes) is deleted.
+**Local proof with manually fragmented frames:** 64 KB sent as 4096-byte
+fragments → reassembled into 1 packet / 64,000 bytes, STT finals
+"hello this is" / "short", Persian captions «سلام این است» / «کوتاه».
+Live re-verification (32 KB frame → +32,000 bytes; full Gemini streaming
+test) is in the final report.
 
 Local proxy (port 10099, same code as pushed):
 - Range 0-65535 / 65536-131071 / 1048576-2097151 → all 206, correct

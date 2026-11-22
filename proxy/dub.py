@@ -486,20 +486,6 @@ def _ws_recv_exact(sock, n):
     return out
 
 
-def _ws_recv_frame(sock):
-    h = _ws_recv_exact(sock, 2)
-    op = h[0] & 0x0F
-    ln = h[1] & 0x7F
-    if ln == 126:
-        ln = struct.unpack(">H", _ws_recv_exact(sock, 2))[0]
-    elif ln == 127:
-        ln = struct.unpack(">Q", _ws_recv_exact(sock, 8))[0]
-    if h[1] & 0x80:
-        _ws_recv_exact(sock, 4)
-    payload = _ws_recv_exact(sock, ln) if ln else b""
-    return op, payload
-
-
 def _js_date():
     return time.strftime("%a %b %d %Y %H:%M:%S GMT+0000 "
                          "(Coordinated Universal Time)", time.gmtime())
@@ -1302,10 +1288,29 @@ def _ws_recv_exact(sock, n):
 
 
 def _ws_recv_frame(sock):
-    """One client frame. Returns (opcode, payload bytes).
-    Client frames are always masked (RFC 6455)."""
+    """One client message, reassembled across continuation frames.
+    Returns (opcode, payload bytes). Client frames are always masked
+    (RFC 6455).
+
+    v3.10 ROOT FIX: a middlebox on the live path (Render/Cloudflare
+    edge) splits any large WS frame into 4096-byte CONTINUATION
+    frames (opcode 0x0). The old code returned only the first frame
+    and silently dropped every continuation — so a 32,000-byte audio
+    frame arrived as 4,096 bytes and 7/8 of the audio never reached
+    Gemini/STT. Proved live 2026-11-22: one 32,000-byte frame raised
+    ws_audio_bytes by exactly 4,096; a 1,000-byte frame by 1,000.
+    Locally (loopback, no middlebox) frames were never split, which
+    is why every local test passed and live subtitles starved. This
+    is very likely the real reason live subtitles never worked on the
+    phone: the relay only ever heard the first 0.128 s of each 1 s
+    audio chunk. Reassembly happens here, so both WS handlers
+    (/dub/ws and /dub/gemini-ws) and the Gemini reader are fixed at
+    once. Control frames (ping/pong/close) are never fragmented in
+    practice; a non-continuation frame arriving mid-message ends the
+    reassembly and is dropped (documented, should not happen)."""
     h = _ws_recv_exact(sock, 2)
     op = h[0] & 0x0F
+    fin = bool(h[0] & 0x80)
     ln = h[1] & 0x7F
     if ln == 126:
         ln = struct.unpack(">H", _ws_recv_exact(sock, 2))[0]
@@ -1315,6 +1320,23 @@ def _ws_recv_frame(sock):
     payload = _ws_recv_exact(sock, ln) if ln else b""
     if mask:
         payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    while not fin:
+        h2 = _ws_recv_exact(sock, 2)
+        op2 = h2[0] & 0x0F
+        fin = bool(h2[0] & 0x80)
+        ln2 = h2[1] & 0x7F
+        if ln2 == 126:
+            ln2 = struct.unpack(">H", _ws_recv_exact(sock, 2))[0]
+        elif ln2 == 127:
+            ln2 = struct.unpack(">Q", _ws_recv_exact(sock, 8))[0]
+        mask2 = _ws_recv_exact(sock, 4) if h2[1] & 0x80 else None
+        part = _ws_recv_exact(sock, ln2) if ln2 else b""
+        if mask2:
+            part = bytes(b ^ mask2[i % 4] for i, b in enumerate(part))
+        if op2 == 0x0:  # continuation: append to the message
+            payload += part
+        else:  # unexpected mid-message frame: stop, drop it
+            break
     return op, payload
 
 
