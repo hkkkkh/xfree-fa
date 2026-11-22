@@ -91,7 +91,31 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-DUB_VERSION = "1.7"
+DUB_VERSION = "1.8"
+
+# v3.9 (2026-11-22) — subtitle root-cause fixes, proved live:
+#  (a) /dub/ws returned EMPTY STT for every window on live Render
+#      while HTTP /dub/stt on the same server returned text for the
+#      same audio (proved 2026-11-22: WS finals all "" with 0.2 s
+#      turnarounds; local WS works; concurrent HTTP STT works live).
+#      The WS debug channel could not tell an empty transcript from
+#      a thrown exception (google_stt returns None on error and the
+#      debug printed ""). _run_stt now reports the exact error.
+#  (b) Gemini Live relay WORKS live at realtime speed (8 Persian
+#      interims over 18 s of speech, first at 5.7 s) with the
+#      user's AQ.-prefixed key — the key is valid. The bridge now
+#      also sends it as the documented `x-goog-api-key` header
+#      (in addition to ?key=), and /dub/gemini-test does a real
+#      REST generateContent call and returns the raw HTTP status +
+#      error — "configured: true" alone proves nothing.
+#  (c) The Gemini reader used to kill the session after 30 s of
+#      Gemini silence (socket timeout -> gemini_closed), even
+#      though Gemini can legitimately take longer to answer on a
+#      slow link. It now waits up to 90 s like the WS path.
+#  (d) WS finals now also try a server-side translate: when the
+#      server CAN translate (it usually cannot from Render's
+#      burned IP), the Persian text is sent straight away, so
+#      captions do not depend on the phone's gtx call alone.
 
 # v3.4: DUBBING IS DEAD — the app is subtitles-only now (user order).
 # Root cause of dead translate: Render's SHARED egress IP is burned
@@ -1057,6 +1081,13 @@ def handle_dub(handler):
         }).encode("utf-8")
         _send_json(handler, 200, body)
         return True
+    if parsed.path == "/dub/gemini-test" and handler.command == "GET":
+        # v3.9: a real Gemini request from this server (see
+        # gemini_test): raw HTTP status + error, never the key.
+        body = json.dumps(gemini_test(),
+                          ensure_ascii=False).encode("utf-8")
+        _send_json(handler, 200, body)
+        return True
     if parsed.path == "/dub/health" and handler.command == "GET":
         body = json.dumps(dub_health(), ensure_ascii=False).encode("utf-8")
         _send_json(handler, 200, body)
@@ -1270,22 +1301,41 @@ def handle_dub_ws(handler):
 
     def _run_stt(pcm, t0, dur, kind):
         """STT one window in a worker; send interim/final JSON."""
-        # v3.6.1 diagnostics: prove the worker can send at all.
-        # (Handler-thread debug arrives live; worker messages do
-        # not. If stt-start arrives but stt-done does not, the
-        # worker is stuck inside google_stt.)
+        # v3.9 diagnostics: the worker used to fail silently on live
+        # Render (stt-done with text "" — indistinguishable from an
+        # empty transcript, because google_stt returns None on error
+        # and the debug printed ""). The exact error is now reported
+        # so a dead STT path can be told apart from silence.
+        _send({"type": "debug", "event": "worker-start", "kind": kind})
         _send({"type": "debug", "event": "stt-start", "kind": kind})
         if state["closed"]:
             return
         if _pcm_rms(pcm) < SILENCE_RMS:
             return  # silent: skip, never invent
-        text, conf = google_stt(pcm, "en-US")
+        try:
+            text, conf = google_stt(pcm, "en-US")
+        except Exception as exc:  # noqa: BLE001 - report, never crash
+            _send({"type": "debug", "event": "stt-error", "kind": kind,
+                   "error": "%s: %s" % (type(exc).__name__, exc)[:200]})
+            return
+        if text is None:
+            _send({"type": "debug", "event": "stt-error", "kind": kind,
+                   "error": "google_stt returned None (request failed)"})
+            return
         _send({"type": "debug", "event": "stt-done", "kind": kind,
-               "text": text if text is not None else ""})
+               "text": text})
         src = "en"
         if text == "":
-            text, conf = google_stt(pcm, "fa-IR")
+            try:
+                text, conf = google_stt(pcm, "fa-IR")
+            except Exception as exc:  # noqa: BLE001
+                _send({"type": "debug", "event": "stt-error",
+                       "kind": kind,
+                       "error": "%s: %s" % (type(exc).__name__, exc)[:200]})
+                return
             src = "fa"
+            if text is None:
+                return
         if state["closed"] or text is None or text == "":
             return
         text = text.strip()
@@ -1294,6 +1344,21 @@ def handle_dub_ws(handler):
             if norm == state["last_final"]:
                 return  # dedup: same words as the previous window
             state["last_final"] = norm
+            # v3.9: server-side translate attempt — when the server
+            # CAN translate, send Persian straight away (lang fa);
+            # the phone then shows it without its own gtx call.
+            # When it cannot (Render's burned IP), the English text
+            # is sent as before and the phone translates.
+            if src == "en":
+                try:
+                    fa = google_translate(text, "en", "fa")
+                except Exception:
+                    fa = None
+                if fa:
+                    _send({"type": kind, "t0": round(t0, 2), "dur": dur,
+                           "text": fa, "lang": "fa",
+                           "conf": round(conf, 2)})
+                    return
         _send({"type": kind, "t0": round(t0, 2), "dur": dur,
                "text": text, "lang": src, "conf": round(conf, 2)})
 
@@ -1454,6 +1519,56 @@ def gemini_configured():
     return bool(gemini_key())
 
 
+def gemini_test():
+    """v3.9: a REAL Gemini request from this server — because
+    "configured: true" proves nothing (it only means the env var
+    is set). POSTs a tiny generateContent call with the key as the
+    documented `x-goog-api-key` header and returns the raw HTTP
+    status + error code/message. The key is NEVER returned, logged
+    or echoed. Returns a JSON-safe dict."""
+    if not gemini_configured():
+        return {"ok": False, "http_status": 0,
+                "error": "not_configured",
+                "detail": "GEMINI_API_KEY is not set on the server"}
+    url = ("https://generativelanguage.googleapis.com/v1beta/"
+           "models/gemini-3.5-flash-lite:generateContent")
+    body = json.dumps({
+        "contents": [{"parts": [{"text": "Say OK"}]}],
+        "generationConfig": {"maxOutputTokens": 5},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json",
+                 "x-goog-api-key": gemini_key()})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        cands = data.get("candidates") or []
+        text = ""
+        try:
+            text = cands[0]["content"]["parts"][0].get("text", "")
+        except Exception:
+            text = ""
+        return {"ok": True, "http_status": resp.status,
+                "error": None, "reply": text.strip()[:40]}
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            raw = exc.read().decode("utf-8", "replace")
+            obj = json.loads(raw)
+            err = obj.get("error") or {}
+            detail = "%s: %s" % (err.get("status", ""),
+                                 err.get("message", ""))[:240]
+        except Exception:
+            detail = raw[:240] if 'raw' in dir() else ""
+        return {"ok": False, "http_status": exc.code,
+                "error": "http_%d" % exc.code, "detail": detail}
+    except Exception as exc:  # noqa: BLE001 - report, never raise
+        return {"ok": False, "http_status": 0,
+                "error": "%s: %s" % (type(exc).__name__, exc)[:200],
+                "detail": ""}
+
+
 def _gemini_parse_out(text):
     """Extract (fa_text, turn_complete) from one Gemini Live JSON
     message. Returns (None, False) when the message carries no
@@ -1519,11 +1634,16 @@ def handle_dub_gemini_ws(handler):
     # --- open the Gemini Live session (key in memory only) ---
     gsock = None
     try:
-        # The path carries the key; it is NEVER logged.
+        # v3.9: the key is sent BOTH as the documented
+        # `x-goog-api-key` header AND as ?key= (the v3.6-verified
+        # form). The URL is never logged; the header is never
+        # logged either. safe_error=True keeps any server error
+        # body out of the exception.
         path = (_GEMINI_WS_PATH + "?key="
                 + urllib.parse.quote(gemini_key(), safe=""))
-        gsock = _ws_connect(_GEMINI_HOST, path, {}, timeout=15,
-                            safe_error=True)
+        gsock = _ws_connect(_GEMINI_HOST, path,
+                            {"x-goog-api-key": gemini_key()},
+                            timeout=15, safe_error=True)
         gsock.settimeout(30)
         _ws_send_text(gsock, json.dumps(_GEMINI_SETUP))
         # Wait for setupComplete (<= 10 s).
@@ -1570,14 +1690,25 @@ def handle_dub_gemini_ws(handler):
 
     def _gemini_reader():
         """Gemini -> app: Persian captions out of outputTranscription."""
+        # v3.9: do NOT kill the session after 30 s of Gemini
+        # silence (the old code broke on the first 30 s socket
+        # timeout and sent gemini_closed, even though Gemini can
+        # legitimately take longer on a slow link). Wait up to 90 s
+        # without any Gemini message, like the WS path.
+        last_msg = time.time()
         try:
             while not state["closed"]:
                 try:
                     op, payload = _ws_recv_frame(gsock)
-                except (EOFError, OSError, socket.timeout):
+                except socket.timeout:
+                    if time.time() - last_msg > _GEMINI_MAX_IDLE:
+                        break
+                    continue
+                except (EOFError, OSError):
                     break
                 if state["closed"]:
                     break
+                last_msg = time.time()
                 if op == 0x8:  # close
                     break
                 if op == 0x9:  # ping -> pong

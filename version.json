@@ -1,1 +1,6 @@
-{"apkUrl":"https://github.com/hkkkkh/xfree-fa/releases/download/v3.8/xfree-fa-3.8.apk","notes":"نسخه ۳٫۸: مسابقه سرعت برای هر ویدیو — اول ۲۵۶ کیلوبایت از CDN مستقیم و از پروکسی هم‌زمان گرفته می‌شود و مسیر سریع‌تر برای پخش انتخاب می‌شود؛ ویدیوی مستقیم با ریدایرکت ۳۰۲ از خود WebView پخش می‌شود","versionCode":29,"versionName":"3.8"}
+{
+  "apkUrl": "https://github.com/hkkkkh/xfree-fa/releases/download/v3.9/xfree-fa-3.9.apk",
+  "notes": "نسخه ۳٫۹: زیرنویس از ریشه درست شد — صدا از فایل ویدیو خوانده می‌شود و صدای پخش هرگز قطع نمی‌شود؛ زیرنویس بالاتر از لبه پایین می‌آید؛ پخش ویدیو دیگر در اولین درخواست منتظر نمی‌ماند",
+  "versionCode": 30,
+  "versionName": "3.9"
+}
