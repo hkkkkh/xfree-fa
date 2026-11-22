@@ -1242,11 +1242,18 @@ def handle_dub_ws(handler):
 
     def _run_stt(pcm, t0, dur, kind):
         """STT one window in a worker; send interim/final JSON."""
+        # v3.6.1 diagnostics: prove the worker can send at all.
+        # (Handler-thread debug arrives live; worker messages do
+        # not. If stt-start arrives but stt-done does not, the
+        # worker is stuck inside google_stt.)
+        _send({"type": "debug", "event": "stt-start", "kind": kind})
         if state["closed"]:
             return
         if _pcm_rms(pcm) < SILENCE_RMS:
             return  # silent: skip, never invent
         text, conf = google_stt(pcm, "en-US")
+        _send({"type": "debug", "event": "stt-done", "kind": kind,
+               "text": text if text is not None else ""})
         src = "en"
         if text == "":
             text, conf = google_stt(pcm, "fa-IR")
