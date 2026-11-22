@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""XFreeFa proxy — tiny no-VPN backend for the Persian XFree app.
+"""XFreeFa proxy v3.0 — fast no-VPN backend for the Persian XFree app.
 
 Runs on Render free tier (or anywhere with Python 3, zero dependencies —
 only the standard library, so there is nothing to pip-install).
@@ -9,68 +9,65 @@ in Iran, so the phone cannot reach them directly with VPN off. The phone
 talks ONLY to this service (onrender.com) and this service — running
 outside Iran — fetches the bytes and streams them back.
 
+v3.0 SPEED (measured 2026-11-22, warm proxy):
+  BEFORE:  / 2.44s (568 KB uncompressed), /playlist 1.23s, /search 1.80s,
+           /_nuxt/ bundle 0.8-1.15s EACH, thumb 0.68s. Every request did
+           a fresh TCP+TLS handshake to upstream (urllib opens a new
+           connection per request) and upstream sent pages uncompressed.
+  AFTER:   keep-alive connection pool (up to 6 reused TLS connections per
+           upstream host), upstream gzip (568 KB page -> ~130 KB on the
+           wire), in-memory cache for anonymous HTML pages (120s) and
+           /_nuxt/ assets (3600s), Jina removed from the hot path
+           (it was unreachable from Render and wasted time on every
+           API JSON body >= 1000 bytes — looks_like_page() is False for
+           JSON, so the old code fired a doomed Jina fetch on API calls).
+           First byte of a cached homepage is served from memory.
+
 Endpoints (all GET unless noted):
-  /                  health check -> "ok"
-  /page?path=/...    site page HTML, fetched via Jina Reader server-side
-                     (&format=md -> Markdown instead of HTML)
-  /img?u=<thumb url>    thumbnail image, streamed from thumbs.xfree.com
-  /static?u=<url>       v2.6 JS bundles / icons from static.xfree.com
-  /video?u=<mp4 url>    video file, streamed from cdn.xfree.com with
-                     HTTP Range passthrough (206), so VideoView seeking
-                     and DownloadManager resume work.
-  /* (any other path)  v2.6 REVERSE PROXY for the WebView app: the whole
-                     site served from this origin, so the real xfree.com
-                     runs inside the app without VPN:
+  /health            -> "ok" (light wake probe; root / is the site now)
+  /                  reverse proxy: the real xfree.com homepage
+  /page?path=/...    site page HTML, direct-first with Jina fallback
+                     (legacy; the app uses the reverse proxy now)
+  /img?u=<url>       thumbnail from thumbs.xfree.com (pooled, cached headers)
+  /static?u=<url>    static.xfree.com asset; .js/.css come from the FAST
+                     www.xfree.com /_nuxt/ path instead (static host is
+                     ~25s/file from Render's IP, www is ~0.8s)
+  /video?u=<mp4 url> video from cdn.xfree.com, streamed, HTTP Range
+                     passthrough (206) so seeking/resume work
+  /x-scraper/<path>  relay to scraper.xfree.com (site's scraper API —
+                     the Nuxt config points the browser straight at
+                     scraper.xfree.com, which is filtered in Iran)
+  /x-upload/<path>   relay to upload.xfree.com/media-api (video upload —
+                     same leak: the site POSTs uploads there directly)
+  /* (any other path) reverse proxy for the whole site:
                      GET /_nuxt/..., /api/..., /video?id=..., /playlist,
-                     /search, /<username> ... are forwarded to
-                     https://www.xfree.com + path, with Cookie /
-                     apiversion / Set-Cookie forwarded, absolute
-                     www/thumbs/cdn URLs rewritten to this proxy, and
+                     /search, /<username> ... forwarded to
+                     https://www.xfree.com + path, Cookie / apiversion /
+                     Set-Cookie forwarded, absolute www/thumbs/cdn/
+                     static/scraper/upload URLs rewritten to this proxy,
                      redirects rewritten to this origin. POSTs to /api/*
-                     are forwarded the same way (login, follow, ...).
-                     /page, /img, /video?u=, /auth, /upload, /diag keep
-                     their old behaviour; /video without ?u= and
-                     /upload (GET) are site pages, not relays.
-  POST /auth         v2.4 JSON relay for login/signup: body
-                     {"url": "https://www.xfree.com/api/...", "body": {...},
-                      "cookies": "anonymous=...; authorization=..."}
-                     -> {"status": <upstream code>, "body": "<text>",
-                         "setCookie": [...]}
-                     Only xfree.com / www.xfree.com are allowed.
-                     Forwards Cookie/Origin/Referer; returns upstream
-                     Set-Cookie (v2.3 dropped them, so login could
-                     never keep a session).
-  GET  /auth?url=... v2.4 GET relay for cookie-authenticated calls
-                     (e.g. GET /api/user/<userId>), same response shape.
-  POST /upload?url=<upload host>   v2.3 raw relay for video uploads:
-                     forwards the multipart body + Content-Type +
-                     Authorization to upload.xfree.com and returns the
-                     upstream status/body. Only upload.xfree.com allowed.
+                     forwarded the same way (login, follow, ...).
+  POST /auth         JSON relay for login/signup (v2.4, unchanged)
+  GET  /auth?url=... cookie-authenticated GET relay (v2.4, unchanged)
+  POST /upload?url=<upload host> raw multipart relay (v2.3, unchanged)
+  GET  /diag?url=... diagnostic only (upstream status/headers)
 
 Security: only these hosts are allowed (anything else -> 403), so the
 proxy cannot be abused as an open proxy:
-  thumbs.xfree.com, cdn.xfree.com, www.xfree.com, xfree.com, r.jina.ai
-
-Deploy on Render (free, ~5 minutes, no card):
-  1. Push this repo to GitHub (or use the xfree-fa repo).
-  2. Render dashboard -> New -> Web Service -> pick the repo.
-  3. Name: xfree-fa-proxy   (EXACT — the app expects
-     https://xfree-fa-proxy.onrender.com)
-     Runtime: Python 3 | Root Directory: proxy
-     Build Command: (leave empty — no dependencies)
-     Start Command: python app.py
-     Plan: Free.
-  4. Deploy, open https://xfree-fa-proxy.onrender.com/ — it must say "ok".
+  thumbs.xfree.com, cdn.xfree.com, www.xfree.com, xfree.com,
+  static.xfree.com, scraper.xfree.com, upload.xfree.com, r.jina.ai
 
 Limits (honest): Render free sleeps after ~15 min idle; the first
-request after sleep takes ~30-60s to wake the service. The app's proxy
-attempts use long read timeouts for pages and fall back to Jina/direct
-if the proxy is unreachable, so a sleeping proxy only slows the first
-load, it does not break the app. Render free also has monthly hours/
-bandwidth limits — fine for personal use, not for sharing publicly.
+request after sleep takes ~30-60s to wake the service (the app loads
+the site immediately and auto-retries; the keep-alive cron pings every
+12 min 07:00-23:00 Tehran, so daytime opens are warm). Render free also
+has monthly hours/bandwidth limits — fine for personal use.
 """
 
+import gzip
+import http.client
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -84,18 +81,19 @@ ALLOWED_HOSTS = {
     "www.xfree.com",
     "xfree.com",
     "static.xfree.com",
+    "scraper.xfree.com",
+    "upload.xfree.com",
     "r.jina.ai",
 }
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-PROXY_VERSION = "2.7"
+PROXY_VERSION = "3.0"
+PROXY_BASE = "https://xfree-fa-proxy.onrender.com"
 
 # v1.9: 900s TTL — the keep-alive pings /page every 12 min, so the
 # cache must outlive the ping interval or the home page is cold again.
-# Home content turns over slowly; a 15-min-stale list is a fair trade
-# for a ~1s load instead of ~9s through Jina.
 _PAGE_CACHE = {}  # (path, want_md) -> (body_bytes, content_type, at)
 _PAGE_CACHE_TTL = 900
 _PAGE_CACHE_LOCK = threading.Lock()
@@ -103,9 +101,217 @@ _PAGE_CACHE_LOCK = threading.Lock()
 CHUNK = 256 * 1024  # v1.4: fewer, bigger writes = faster streaming
                       # through the 0.1-CPU Render free instance
 
+# ----------------------------------------------------------------------
+# v3.0: keep-alive upstream connection pool.
+# The old code used urllib.request.urlopen() per request: every single
+# subresource (15 JS bundles, dozens of thumbs) paid a fresh TCP+TLS
+# handshake to upstream (~0.4-0.7s each on this host). A page load is
+# ~30 upstream requests, so handshakes alone cost seconds. The pool
+# keeps up to 6 reusable TLS connections per host (what browsers do);
+# a reused connection answers in ~0.1-0.2s. Connections are NOT shared
+# between threads: each pooled slot has its own lock.
+# ----------------------------------------------------------------------
+class ConnPool:
+    MAX_PER_HOST = 6
+
+    def __init__(self):
+        self._guard = threading.Lock()
+        self._pools = {}  # host -> list of [conn, lock]
+
+    def _new_conn(self, host, timeout):
+        """Direct TLS, unless this machine routes egress through an
+        HTTP proxy (https_proxy env — this dev VM does; Render does
+        not). http.client ignores env proxies, unlike urllib, so
+        tunnel explicitly with CONNECT; the tunnel itself is
+        keep-alive, so pooling still works through it."""
+        proxy = (os.environ.get("https_proxy")
+                 or os.environ.get("HTTPS_PROXY") or "")
+        if proxy:
+            p = urllib.parse.urlparse(proxy)
+            if p.scheme in ("http", "https") and p.hostname:
+                # HTTPSConnection (not HTTPConnection): connect() does
+                # the CONNECT tunnel AND then wraps the socket in TLS.
+                # Plain HTTPConnection would send HTTP to port 443
+                # ("plain HTTP request was sent to HTTPS port").
+                conn = http.client.HTTPSConnection(
+                    p.hostname, p.port or 3128, timeout=timeout)
+                headers = {}
+                if p.username:
+                    import base64
+                    cred = base64.b64encode(
+                        ("%s:%s" % (
+                            urllib.parse.unquote(p.username),
+                            urllib.parse.unquote(p.password or ""))).encode()
+                    ).decode()
+                    headers["Proxy-Authorization"] = "Basic " + cred
+                conn.set_tunnel(host, 443, headers=headers)
+                return conn
+        return http.client.HTTPSConnection(host, timeout=timeout)
+
+    def acquire(self, host, timeout):
+        """Return (conn, slot). slot is None for an ephemeral conn
+        (created when all pooled slots are busy — closed after use)."""
+        deadline = time.time() + 5.0
+        while True:
+            with self._guard:
+                pool = self._pools.setdefault(host, [])
+                for slot in pool:
+                    if slot[1].acquire(blocking=False):
+                        return slot[0], slot
+                if len(pool) < self.MAX_PER_HOST:
+                    conn = self._new_conn(host, timeout)
+                    lock = threading.Lock()
+                    lock.acquire()
+                    slot = [conn, lock]
+                    pool.append(slot)
+                    return conn, slot
+            if time.time() > deadline:
+                return self._new_conn(host, timeout), None
+            time.sleep(0.02)
+
+    def release(self, host, conn, slot, broken=False):
+        if slot is None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
+        if broken:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._guard:
+                pool = self._pools.get(host, [])
+                if slot in pool:
+                    pool.remove(slot)
+            try:
+                slot[1].release()
+            except Exception:
+                pass
+            return
+        try:
+            slot[1].release()
+        except Exception:
+            pass
+
+
+POOL = ConnPool()
+
+
+def _header_get(headers, name):
+    """Case-insensitive lookup in a [(name, value)] list. Returns ''."""
+    low = name.lower()
+    for k, v in headers:
+        if k.lower() == low:
+            return v
+    return ""
+
+
+def _header_all(headers, name):
+    low = name.lower()
+    return [v for k, v in headers if k.lower() == low]
+
+
+def pool_request(host, method, path, headers, body=None, timeout=15):
+    """One upstream request over a pooled keep-alive connection.
+    Returns (status, [(name, value), ...], body_bytes). Upstream gzip
+    is requested and transparently decompressed (the old code fetched
+    pages uncompressed: 568 KB per homepage). Retries once on a stale
+    pooled connection (server closed it while idle)."""
+    headers = dict(headers)
+    headers.setdefault("Accept-Encoding", "gzip")
+    last_exc = None
+    for _attempt in range(2):
+        conn, slot = POOL.acquire(host, timeout)
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            resp = conn.getresponse()
+            data = resp.read()
+            status = resp.status
+            hdrs = resp.getheaders()
+            POOL.release(host, conn, slot)
+            enc = _header_get(hdrs, "Content-Encoding")
+            if enc == "gzip" and data:
+                try:
+                    data = gzip.decompress(data)
+                except Exception:
+                    pass
+                hdrs = [(k, v) for k, v in hdrs
+                        if k.lower() != "content-encoding"]
+                hdrs = [(k, v) for k, v in hdrs
+                        if k.lower() != "content-length"]
+                hdrs.append(("Content-Length", str(len(data))))
+            elif enc == "deflate" and data:
+                try:
+                    import zlib
+                    data = zlib.decompress(data)
+                except Exception:
+                    pass
+                hdrs = [(k, v) for k, v in hdrs
+                        if k.lower() not in ("content-encoding",
+                                             "content-length")]
+                hdrs.append(("Content-Length", str(len(data))))
+            return status, hdrs, data
+        except Exception as exc:  # stale pooled conn, reset, timeout...
+            last_exc = exc
+            POOL.release(host, conn, slot, broken=True)
+    raise last_exc
+
+
+# ----------------------------------------------------------------------
+# v3.0: response cache for anonymous GETs.
+# The homepage / playlist / search HTML is identical for every logged-out
+# visitor and turns over slowly; serving it from memory makes the cold
+# open ~instant once the proxy is awake. NEVER cached: anything with a
+# Cookie (logged-in / session), POSTs, /api/rs/next (cursor), /api/user/me.
+# ----------------------------------------------------------------------
+_RP_CACHE = {}  # key -> (status, headers, body, at)
+_RP_CACHE_LOCK = threading.Lock()
+_RP_CACHE_RULES = [  # (path prefix / exact, ttl seconds)
+    ("/_nuxt/", 3600),          # hashed filenames = immutable
+    ("/api/post/", 300),        # video metadata, near-static
+    ("/api/tag/", 300),
+    ("/api/playlist/", 300),
+    ("/api/user/", 120),        # public profiles (not /api/user/me)
+    ("/api/rs/homepage", 30),   # anonymous recommendation feed
+]
+
+
+def _cache_ttl(path):
+    for prefix, ttl in _RP_CACHE_RULES:
+        if path.startswith(prefix):
+            return ttl
+    return 0
+
+
+def _cache_get(key):
+    with _RP_CACHE_LOCK:
+        hit = _RP_CACHE.get(key)
+        if hit is not None and time.time() - hit[3] < hit[4]:
+            return hit
+        if hit is not None:
+            del _RP_CACHE[key]
+    return None
+
+
+def _cache_put(key, status, headers, body, ttl):
+    if ttl <= 0 or len(body) > 2 * 1024 * 1024:
+        return
+    # NEVER cache Set-Cookie: the homepage sets a per-visitor
+    # anonymous JWT; caching it would hand every visitor the SAME
+    # anonymous session.
+    headers = [(k, v) for k, v in headers if k.lower() != "set-cookie"]
+    with _RP_CACHE_LOCK:
+        if len(_RP_CACHE) > 200:  # bound memory on a 512 MB instance
+            _RP_CACHE.clear()
+        _RP_CACHE[key] = (status, headers, body, time.time(), ttl)
+
 
 def fetch_stream(url, headers, timeout=30):
-    """Open an upstream URL, return the response object (caller streams it)."""
+    """Open an upstream URL, return the response object (caller streams it).
+    Used ONLY for video Range streams (one long-lived connection per
+    stream — pooling would block the slot for the whole playback)."""
     req = urllib.request.Request(url, headers=headers)
     return urllib.request.urlopen(req, timeout=timeout)
 
@@ -121,6 +327,13 @@ def looks_like_page(body):
             or b"attention required" in low or b"captcha" in low:
         return False
     return True
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    # v3.0: a page load fires ~30 parallel subrequests; the default
+    # listen backlog (5) queued/dropped them under load.
+    request_queue_size = 128
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -194,11 +407,6 @@ class Handler(BaseHTTPRequestHandler):
         self.handle_all()
 
     def do_POST(self):
-        # v2.3 POST relays (login + upload). The phone cannot reach
-        # xfree.com directly in Iran; these forward the request from
-        # outside Iran and return the REAL upstream status/body.
-        # Nothing here invents a success: a failed upstream is
-        # reported with its real code.
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
         try:
@@ -215,6 +423,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/upload":
             self.handle_upload(query, raw)
+            return
+        # v3.0: scraper / upload relays (any method, any path under
+        # the prefix) — the site calls these hosts directly, which is
+        # filtered in Iran; the rewritten JS calls the proxy instead.
+        if parsed.path.startswith("/x-scraper/"):
+            self.handle_host_relay("scraper.xfree.com", "/x-scraper",
+                                   parsed, raw,
+                                   self.headers.get("Content-Type"))
+            return
+        if parsed.path.startswith("/x-upload/"):
+            self.handle_host_relay("upload.xfree.com", "/x-upload",
+                                   parsed, raw,
+                                   self.headers.get("Content-Type"))
             return
         # v2.6: any other POST (e.g. /api/login, /api/follow) goes
         # through the reverse proxy to the real site.
@@ -237,8 +458,71 @@ class Handler(BaseHTTPRequestHandler):
             length = 0
         raw = self.rfile.read(length) if length > 0 else b""
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/x-scraper/"):
+            self.handle_host_relay("scraper.xfree.com", "/x-scraper",
+                                   parsed, raw,
+                                   self.headers.get("Content-Type"))
+            return
+        if parsed.path.startswith("/x-upload/"):
+            self.handle_host_relay("upload.xfree.com", "/x-upload",
+                                   parsed, raw,
+                                   self.headers.get("Content-Type"))
+            return
         self.handle_reverse_proxy(parsed, raw,
                                   self.headers.get("Content-Type"))
+
+    def handle_host_relay(self, host, prefix, parsed, raw, content_type):
+        """Forward a request to scraper.xfree.com / upload.xfree.com
+        (path after the prefix, same method/body/headers) and return
+        the upstream status/body verbatim. Used by the rewritten site
+        JS, which otherwise calls these filtered hosts directly."""
+        rest = parsed.path[len(prefix):] or "/"
+        target = rest
+        if parsed.query:
+            target += "?" + parsed.query
+        headers = {"User-Agent": UA}
+        for name in ("Accept", "Accept-Language", "Range", "If-Range"):
+            value = self.headers.get(name)
+            if value:
+                headers[name] = value
+        cookies = self.headers.get("Cookie")
+        if cookies:
+            headers["Cookie"] = cookies
+        auth = self.headers.get("Authorization")
+        if auth:
+            headers["Authorization"] = auth
+        if content_type:
+            headers["Content-Type"] = content_type
+        headers["Origin"] = "https://www.xfree.com"
+        headers["Referer"] = "https://www.xfree.com/"
+        try:
+            status, resp_headers, body = pool_request(
+                host, self.command, target, headers,
+                body=raw or None, timeout=60)
+        except Exception as exc:
+            self.send_text(502, "upstream failed: %s" % exc)
+            return
+        ctype = _header_get(resp_headers, "Content-Type")
+        body = self._rewrite_body(body, ctype)
+        self.send_response(status)
+        if ctype:
+            self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for name in ("Cache-Control", "Content-Range", "Accept-Ranges",
+                     "Content-Disposition", "ETag"):
+            value = _header_get(resp_headers, name)
+            if value:
+                self.send_header(name, value)
+        loc = _header_get(resp_headers, "Location")
+        if loc:
+            self.send_header("Location", self._rewrite_location(loc))
+        for cookie in _header_all(resp_headers, "Set-Cookie"):
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("X-Proxy-Version", PROXY_VERSION)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def handle_auth(self, raw):
         """POST /auth {"url": ..., "body": {...}, "cookies": "...",
@@ -285,19 +569,13 @@ class Handler(BaseHTTPRequestHandler):
             headers["Referer"] = referer
         try:
             import json
-            req = urllib.request.Request(
-                target,
-                data=json.dumps(body).encode("utf-8"),
-                headers=headers,
-                method="POST")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                upstream_body = resp.read(20000).decode("utf-8", "replace")
-                status = resp.status
-                set_cookie = resp.headers.get_all("Set-Cookie") or []
-        except urllib.error.HTTPError as exc:
-            upstream_body = exc.read(20000).decode("utf-8", "replace")
-            status = exc.code
-            set_cookie = exc.headers.get_all("Set-Cookie") or []
+            status, resp_headers, upstream = pool_request(
+                host, "POST", urllib.parse.urlparse(target).path
+                + (("?" + urllib.parse.urlparse(target).query)
+                   if urllib.parse.urlparse(target).query else ""),
+                headers, body=json.dumps(body).encode("utf-8"), timeout=30)
+            upstream_body = upstream.decode("utf-8", "replace")
+            set_cookie = _header_all(resp_headers, "Set-Cookie")
         except Exception as exc:
             self.send_text(502, "upstream failed: %s" % exc)
             return
@@ -327,17 +605,14 @@ class Handler(BaseHTTPRequestHandler):
         cookies = self.headers.get("Cookie")
         if cookies:
             headers["Cookie"] = cookies
+        parsed_t = urllib.parse.urlparse(target)
+        path = parsed_t.path + (("?" + parsed_t.query)
+                                if parsed_t.query else "")
         try:
-            req = urllib.request.Request(target, headers=headers,
-                                         method="GET")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                upstream_body = resp.read(20000).decode("utf-8", "replace")
-                status = resp.status
-                set_cookie = resp.headers.get_all("Set-Cookie") or []
-        except urllib.error.HTTPError as exc:
-            upstream_body = exc.read(20000).decode("utf-8", "replace")
-            status = exc.code
-            set_cookie = exc.headers.get_all("Set-Cookie") or []
+            status, resp_headers, upstream = pool_request(
+                host, "GET", path, headers, timeout=30)
+            upstream_body = upstream.decode("utf-8", "replace")
+            set_cookie = _header_all(resp_headers, "Set-Cookie")
         except Exception as exc:
             self.send_text(502, "upstream failed: %s" % exc)
             return
@@ -361,32 +636,23 @@ class Handler(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization")
         if auth:
             headers["Authorization"] = auth
+        parsed_t = urllib.parse.urlparse(target)
+        path = parsed_t.path + (("?" + parsed_t.query)
+                                if parsed_t.query else "")
         try:
-            req = urllib.request.Request(target, data=raw,
-                                         headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                body = resp.read(20000)
-                self.send_response(resp.status)
-                self.send_header("Content-Type",
-                                 resp.headers.get("Content-Type",
-                                                  "text/plain; charset=utf-8"))
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("X-Proxy-Version", PROXY_VERSION)
-                self.end_headers()
-                self.wfile.write(body)
-                return
-        except urllib.error.HTTPError as exc:
-            body = exc.read(20000)
-            self.send_response(exc.code)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("X-Proxy-Version", PROXY_VERSION)
-            self.end_headers()
-            self.wfile.write(body)
-            return
+            status, resp_headers, body = pool_request(
+                host, "POST", path, headers, body=raw or None, timeout=120)
         except Exception as exc:
             self.send_text(502, "upstream failed: %s" % exc)
             return
+        self.send_response(status)
+        self.send_header("Content-Type",
+                         _header_get(resp_headers, "Content-Type")
+                         or "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Proxy-Version", PROXY_VERSION)
+        self.end_headers()
+        self.wfile.write(body)
 
     def handle_diag(self, query):
         """GET /diag?url=https://www.xfree.com/... — diagnostic only:
@@ -400,18 +666,14 @@ class Handler(BaseHTTPRequestHandler):
                 or not target.startswith("https://"):
             self.send_text(403, "disallowed diag target")
             return
+        parsed_t = urllib.parse.urlparse(target)
+        path = parsed_t.path + (("?" + parsed_t.query)
+                                if parsed_t.query else "")
         try:
-            req = urllib.request.Request(
-                target, headers={"User-Agent": UA}, method="GET")
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                status = resp.status
-                headers = dict(resp.headers.items())
-                set_cookie = resp.headers.get_all("Set-Cookie") or []
-                resp.read(1)
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            headers = dict(exc.headers.items())
-            set_cookie = exc.headers.get_all("Set-Cookie") or []
+            status, resp_headers, _body = pool_request(
+                host, "GET", path, {"User-Agent": UA}, timeout=30)
+            headers = dict(resp_headers)
+            set_cookie = _header_all(resp_headers, "Set-Cookie")
         except Exception as exc:
             self.send_text(502, "upstream failed: %s" % exc)
             return
@@ -436,7 +698,9 @@ class Handler(BaseHTTPRequestHandler):
     def _rewrite_body(self, body, ctype):
         """Rewrite absolute site URLs in text bodies so subresources
         stay on the proxy origin instead of the filtered hosts.
-        Only for text/* and JS/JSON; binary bodies pass through."""
+        Only for text/* and JS/JSON; binary bodies pass through.
+        Also handles the \\u002F-escaped URLs inside the Nuxt state
+        JSON (e.g. scraperUrl:"https:\\u002F\\u002Fscraper.xfree.com")."""
         if not body or not ctype:
             return body
         low = ctype.lower()
@@ -447,8 +711,27 @@ class Handler(BaseHTTPRequestHandler):
             text = body.decode("utf-8")
         except Exception:
             return body
-        import re
-        base = "https://xfree-fa-proxy.onrender.com"
+        base = PROXY_BASE
+        esc = "https:\\u002F\\u002F"
+        # v3.0: the Nuxt config sends the browser straight to
+        # scraper.xfree.com and upload.xfree.com/media-api — both
+        # filtered in Iran, so upload/scraper would silently fail.
+        # Rewrite them to the proxy relays (added in v3.0).
+        text = text.replace("https://scraper.xfree.com",
+                            base + "/x-scraper")
+        text = text.replace("https://upload.xfree.com",
+                            base + "/x-upload")
+        text = text.replace("//scraper.xfree.com", "//" + base[8:] + "/x-scraper")
+        text = text.replace("//upload.xfree.com", "//" + base[8:] + "/x-upload")
+        text = text.replace(esc + "scraper.xfree.com",
+                            esc + "xfree-fa-proxy.onrender.com\\u002Fx-scraper")
+        text = text.replace(esc + "upload.xfree.com",
+                            esc + "xfree-fa-proxy.onrender.com\\u002Fx-upload")
+        text = text.replace(esc + "www.xfree.com", esc + "xfree-fa-proxy.onrender.com")
+        text = text.replace(esc + "xfree.com", esc + "xfree-fa-proxy.onrender.com")
+        text = text.replace(esc + "thumbs.xfree.com", esc + "xfree-fa-proxy.onrender.com\\u002Fimg?u=https:\\u002F\\u002Fthumbs.xfree.com")
+        text = text.replace(esc + "cdn.xfree.com", esc + "xfree-fa-proxy.onrender.com\\u002Fvideo?u=https:\\u002F\\u002Fcdn.xfree.com")
+        text = text.replace(esc + "static.xfree.com", esc + "xfree-fa-proxy.onrender.com\\u002Fstatic?u=https:\\u002F\\u002Fstatic.xfree.com")
         # thumbs/cdn absolute URLs -> proxy /img / /video relays
         def _thumb(m):
             u = m.group(0)
@@ -458,21 +741,18 @@ class Handler(BaseHTTPRequestHandler):
             return base + "/video?u=" + urllib.parse.quote(u, safe="")
         text = re.sub(r"https://thumbs\.xfree\.com/[^\s\"'<>]+", _thumb, text)
         text = re.sub(r"https://cdn\.xfree\.com/[^\s\"'<>]+", _cdn, text)
-        # v2.7: static.xfree.com is ~25s+ per request FROM Render's IP
+        # v2.7/v3.0: static.xfree.com is ~25s+ per request FROM Render's IP
         # (measured 2026-11-22: /static?u=<js> took 25s for 9 KB, and
-        # /_nuxt/<same file> via www.xfree.com took 0.77s) — the site
-        # rewrites every JS bundle through /static, so Nuxt never
-        # booted in the WebView and the page stayed black. The same
-        # bundles are served by www.xfree.com under /_nuxt/, so .js
-        # goes there (fast reverse proxy); only non-JS static assets
-        # (icons/svg) still use /static — they can be slow without
-        # blocking the boot.
-        def _static_js(m):
+        # /_nuxt/<same file> via www.xfree.com took 0.77s). The same
+        # bundles are served by www.xfree.com under /_nuxt/, so .js AND
+        # .css go there (fast pooled path); only non-JS/CSS static assets
+        # (icons/svg) still use /static.
+        def _static_fast(m):
             u = m.group(0)
             name = u.rsplit("/", 1)[-1]
             return base + "/_nuxt/" + name
-        text = re.sub(r"https://static\.xfree\.com/[^\s\"'<>]+\.js",
-                      _static_js, text)
+        text = re.sub(r"https://static\.xfree\.com/[^\s\"'<>]+\.(?:js|css)",
+                      _static_fast, text)
         def _static(m):
             u = m.group(0)
             return base + "/static?u=" + urllib.parse.quote(u, safe="")
@@ -485,19 +765,42 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_reverse_proxy(self, parsed, raw=b"", content_type=None):
         """Forward any other path/method to https://www.xfree.com
-        and return the upstream response verbatim (status, headers,
-        Set-Cookie, body). Direct first; for an HTML GET that comes
-        back as a Cloudflare challenge, fall back to Jina like
-        /page does. No caching here — API/session responses must
-        never be served stale."""
+        and return the upstream response (status, headers, Set-Cookie,
+        body). v3.0: pooled keep-alive + upstream gzip + anonymous
+        response cache. Jina fires ONLY for an HTML page that came back
+        as a Cloudflare challenge (never on the happy path, never for
+        API JSON — the v2.x bug was firing a doomed Jina fetch on every
+        API body >= 1000 bytes, because looks_like_page() is False for
+        JSON). A challenge page is still never served as if it were
+        the site."""
         path = parsed.path
         if path.startswith("/site/"):
             path = path[5:] or "/"
         if not path.startswith("/"):
             path = "/" + path
-        target = "https://www.xfree.com" + path
+        target_path = path
         if parsed.query:
-            target += "?" + parsed.query
+            target_path += "?" + parsed.query
+        method = self.command
+        has_cookie = bool(self.headers.get("Cookie"))
+        # v3.0 cache: anonymous GETs only.
+        cache_key = None
+        cache_ttl = 0
+        if method == "GET" and not has_cookie:
+            if path.startswith("/_nuxt/"):
+                cache_ttl = 3600
+            else:
+                cache_ttl = _cache_ttl(path)
+                if path in ("/", "/playlist") or path.startswith("/search") \
+                        or path.startswith("/video"):
+                    cache_ttl = max(cache_ttl, 120)
+            if cache_ttl > 0:
+                cache_key = (method, target_path)
+                hit = _cache_get(cache_key)
+                if hit is not None:
+                    _status, _hdrs, _body, _at, _ttl = hit
+                    self._send_proxied(_status, _hdrs, _body, cache_hit=True)
+                    return
         headers = {"User-Agent": UA}
         for name in ("Accept", "Accept-Language", "Range", "If-Range"):
             value = self.headers.get(name)
@@ -510,87 +813,89 @@ class Handler(BaseHTTPRequestHandler):
             headers["apiversion"] = "1.0"
             headers["language"] = "en"
         origin = self.headers.get("Origin") or ""
-        if origin.startswith("https://xfree-fa-proxy.onrender.com"):
+        if origin.startswith(PROXY_BASE):
             origin = "https://www.xfree.com"
         headers["Origin"] = origin or "https://www.xfree.com"
         referer = self.headers.get("Referer") or ""
-        if referer.startswith("https://xfree-fa-proxy.onrender.com"):
-            referer = "https://www.xfree.com/" + referer[len(
-                "https://xfree-fa-proxy.onrender.com/"):]
+        if referer.startswith(PROXY_BASE):
+            referer = "https://www.xfree.com/" + referer[len(PROXY_BASE + "/"):]
         headers["Referer"] = referer or "https://www.xfree.com/"
         if content_type:
             headers["Content-Type"] = content_type
-        method = self.command
-        status = 502
-        body = b"upstream failed"
-        resp_headers = {}
-        set_cookie = []
         try:
-            req = urllib.request.Request(target, data=raw or None,
-                                         headers=headers, method=method)
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                status = resp.status
-                body = resp.read(25 * 1024 * 1024)
-                resp_headers = dict(resp.headers.items())
-                set_cookie = resp.headers.get_all("Set-Cookie") or []
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            try:
-                body = exc.read(25 * 1024 * 1024)
-            except Exception:
-                body = b""
-            resp_headers = dict(exc.headers.items())
-            set_cookie = exc.headers.get_all("Set-Cookie") or []
+            status, resp_headers, body = pool_request(
+                "www.xfree.com", method, target_path, headers,
+                body=raw or None, timeout=30)
         except Exception as exc:
-            body = ("upstream failed: %s" % exc).encode("utf-8")
-            status = 502
-        # HTML GET that got a challenge page: retry via Jina (same
-        # fallback as /page) instead of serving the challenge.
-        if (method == "GET"
-                and not looks_like_page(body)
-                and len(body) >= 1000):
+            self.send_text(502, "upstream failed: %s" % exc)
+            return
+        ctype = _header_get(resp_headers, "Content-Type") or ""
+        body = self._rewrite_body(body, ctype)
+        if method == "GET" and ctype.startswith("text/html") \
+                and len(body) >= 1000 and not looks_like_page(body):
+            # v3.0: Cloudflare challenge page (or a 403 with one).
+            # The happy path (Render's IP, 200 + real page) never
+            # reaches this — it costs nothing when direct works.
+            # When the IP IS challenged, Jina Reader is the only
+            # fallback that still returns the real page (same as
+            # legacy /page). One attempt, short timeout; if it also
+            # fails, report the real failure instead of a fake page.
+            jina_url = ("https://r.jina.ai/https://www.xfree.com"
+                        + target_path)
             try:
-                jina_url = "https://r.jina.ai/" + target
                 req = urllib.request.Request(
                     jina_url,
                     headers={"User-Agent": UA,
                              "X-Return-Format": "html"},
                     method="GET")
-                with urllib.request.urlopen(req, timeout=20) as resp:
+                with urllib.request.urlopen(req, timeout=15) as resp:
                     cand = resp.read(25 * 1024 * 1024)
-                    if looks_like_page(cand):
-                        body = cand
-                        status = 200
-                        resp_headers = {"Content-Type":
-                                        "text/html; charset=utf-8"}
-                        set_cookie = []
+                if looks_like_page(cand):
+                    body = cand
+                    status = 200
+                    ctype = "text/html; charset=utf-8"
+                    resp_headers = [("Content-Type", ctype)]
+                else:
+                    self.send_text(
+                        502, "upstream blocked (challenge page)")
+                    return
             except Exception:
-                pass
-        ctype = resp_headers.get("Content-Type") or ""
-        body = self._rewrite_body(body, ctype)
-        if ctype.startswith("text/html") and not looks_like_page(body) \
-                and status == 200 and len(body) >= 1000:
-            # Still a challenge page after Jina: do not pretend it
-            # is the site — report the real failure.
-            status = 502
-            body = b"upstream blocked (challenge page)"
+                self.send_text(502, "upstream blocked (challenge page)")
+                return
+        if cache_key is not None and status == 200:
+            if ctype.startswith("text/html") and not looks_like_page(body):
+                pass  # never cache a challenge page
+            else:
+                _cache_put(cache_key, status, resp_headers, body, cache_ttl)
+        self._send_proxied(status, resp_headers, body)
+
+    def _send_proxied(self, status, resp_headers, body, cache_hit=False):
+        """Send a reverse-proxied response: status, headers (with
+        Location rewritten to this origin, Set-Cookie passed through),
+        body. Used by handle_reverse_proxy and the cache path."""
         self.send_response(status)
+        ctype = _header_get(resp_headers, "Content-Type")
         if ctype:
             self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         for name in ("Cache-Control", "Content-Range", "Accept-Ranges",
                      "Content-Disposition", "ETag"):
-            if resp_headers.get(name):
-                self.send_header(name, resp_headers[name])
-        loc = resp_headers.get("Location")
+            value = _header_get(resp_headers, name)
+            if value:
+                self.send_header(name, value)
+        loc = _header_get(resp_headers, "Location")
         if loc:
             self.send_header("Location", self._rewrite_location(loc))
-        for cookie in set_cookie:
+        for cookie in _header_all(resp_headers, "Set-Cookie"):
             self.send_header("Set-Cookie", cookie)
         self.send_header("X-Proxy-Version", PROXY_VERSION)
+        if cache_hit:
+            self.send_header("X-Proxy-Cache", "HIT")
+        else:
+            self.send_header("X-Proxy-Cache", "MISS")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        if self.command != "HEAD" and method != "HEAD":
+        if self.command != "HEAD":
             self.wfile.write(body)
 
     def handle_all(self):
@@ -634,6 +939,17 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_reverse_proxy(parsed)
             return
 
+        # v3.0: scraper / upload relays (GET side; POST/PUT/DELETE
+        # are routed in do_POST/_do_write_method).
+        if parsed.path.startswith("/x-scraper/"):
+            self.handle_host_relay("scraper.xfree.com", "/x-scraper",
+                                   parsed, b"", None)
+            return
+        if parsed.path.startswith("/x-upload/"):
+            self.handle_host_relay("upload.xfree.com", "/x-upload",
+                                   parsed, b"", None)
+            return
+
         # v2.6: everything else is the real site, served from this
         # origin (/_nuxt/..., /api/..., /playlist, /search,
         # /<username>, ...). Unknown paths are NOT invented — the
@@ -648,8 +964,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Proxy-Cache", "HIT" if hit else "MISS")
         # v1.9 diagnostic: what the upstream (Jina/direct) actually did
         # and how long it took, e.g. "jina:200:8.4s" or "jina:429:2.0s".
-        # The ~9s MISS cost lives here, not in the app — this header
-        # proves whether it is Jina slowness or a 429 retry from Render.
         upstream = getattr(self, "_upstream", "")
         if upstream:
             self.send_header("X-Upstream", upstream)
@@ -742,30 +1056,90 @@ class Handler(BaseHTTPRequestHandler):
                 or not self.allowed(target):
             self.send_text(400, "bad or disallowed url")
             return
-        # v2.7: video keeps 2 attempts / 30s (a big stream must not
-        # die on one hiccup); img/static get 1 attempt / 12s — a
-        # slow icon must fail fast, never block the page boot.
-        timeout = 30 if _kind == "video" else 12
-        attempts = 2 if _kind == "video" else 1
-        last_exc = None
-        for attempt in range(attempts):
-            try:
-                with fetch_stream(target, self.upstream_headers(),
-                                 timeout=timeout) as resp:
-                    self.stream_response(resp)
+        # v3.0: .js/.css via /static now come from the FAST www
+        # /_nuxt/ path (pooled) instead of the slow static host.
+        if _kind == "static":
+            low = target.lower()
+            if low.endswith(".js") or low.endswith(".css"):
+                name = target.rsplit("/", 1)[-1]
+                try:
+                    status, resp_headers, body = pool_request(
+                        "www.xfree.com", "GET", "/_nuxt/" + name,
+                        {"User-Agent": UA,
+                         "Accept": self.headers.get("Accept") or "*/*"},
+                        timeout=15)
+                except Exception as exc:
+                    self.send_text(502, "upstream failed: %s" % exc)
+                    return
+                self.send_response(status)
+                ctype = _header_get(resp_headers, "Content-Type")
+                if ctype:
+                    self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                cc = _header_get(resp_headers, "Cache-Control")
+                if cc:
+                    self.send_header("Cache-Control", cc)
+                self.send_header("X-Proxy-Version", PROXY_VERSION)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
                 return
-            except urllib.error.HTTPError as exc:
-                self.send_text(exc.code or 502, "upstream error %s" % exc.code)
-                return
-            except Exception as exc:
-                last_exc = exc
-                if attempt + 1 < attempts:
-                    time.sleep(1)
-        self.send_text(502, "upstream failed: %s" % last_exc)
+        if _kind == "video":
+            # Long-lived Range stream: dedicated connection (pool
+            # slots must not be held for a whole playback).
+            timeout = 30
+            attempts = 2
+            last_exc = None
+            for attempt in range(attempts):
+                try:
+                    with fetch_stream(target, self.upstream_headers(),
+                                     timeout=timeout) as resp:
+                        self.stream_response(resp)
+                    return
+                except urllib.error.HTTPError as exc:
+                    self.send_text(exc.code or 502,
+                                   "upstream error %s" % exc.code)
+                    return
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt + 1 < attempts:
+                        time.sleep(1)
+            self.send_text(502, "upstream failed: %s" % last_exc)
+            return
+        # v3.0: thumbs + static icons via the pooled connection
+        # (keep-alive) instead of a fresh TLS handshake per image.
+        parsed_t = urllib.parse.urlparse(target)
+        host = parsed_t.hostname
+        path = parsed_t.path + (("?" + parsed_t.query)
+                                if parsed_t.query else "")
+        try:
+            status, resp_headers, body = pool_request(
+                host, "GET", path, self.upstream_headers(), timeout=12)
+        except Exception as exc:
+            self.send_text(502, "upstream failed: %s" % exc)
+            return
+        self.send_response(status)
+        ctype = _header_get(resp_headers, "Content-Type")
+        if ctype:
+            self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for name in ("Content-Range", "Accept-Ranges", "Cache-Control"):
+            value = _header_get(resp_headers, name)
+            if value:
+                self.send_header(name, value)
+        if _kind == "image" and not _header_get(resp_headers,
+                                                 "Cache-Control"):
+            self.send_header("Cache-Control", "public, max-age=86400")
+        self.send_header("X-Proxy-Version", PROXY_VERSION)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    server = Server(("0.0.0.0", port), Handler)
     print("xfree-fa proxy listening on port %d" % port, flush=True)
     server.serve_forever()

@@ -1,1 +1,1 @@
-{"apkUrl":"https://github.com/hkkkkh/xfree-fa/releases/download/v2.9/xfree-fa-2.9.apk","notes":"نسخه ۲٫۹: بدون اسپلش و پیش‌نمایش — سایت مستقیم در صفحه باز می‌شود؛ باندل‌های JS از مسیر سریع /_nuxt/ می‌آیند (رفع صفحه سیاه)","versionCode":20,"versionName":"2.9"}
+{"apkUrl":"https://github.com/hkkkkh/xfree-fa/releases/download/v3.0/xfree-fa-3.0.apk","notes":"نسخه ۳٫۰: پروکسی سریع — اتصال‌های ماندگار، gzip، کش صفحه اصلی و باندل‌ها؛ آپلود و اسکریپر هم از پروکسی می‌گذرند؛ باز شدن سرد حداکثر سرعت","versionCode":21,"versionName":"3.0"}
