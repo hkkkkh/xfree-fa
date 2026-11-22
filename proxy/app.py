@@ -125,6 +125,8 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import dub as dub_mod  # v3.2: live Persian dubbing (stdlib only, no keys)
+
 ALLOWED_HOSTS = {
     "thumbs.xfree.com",
     "cdn.xfree.com",
@@ -627,6 +629,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         raw = self.rfile.read(length) if length > 0 else b""
 
+        # v3.2: live Persian dubbing endpoints.
+        if parsed.path.startswith("/dub/"):
+            if dub_mod.handle_dub(self):
+                return
         if parsed.path.startswith("/g/"):
             self.handle_generic_relay(parsed, raw,
                                       self.headers.get("Content-Type"))
@@ -1207,6 +1213,11 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path in ("/health",):
             self.send_text(200, "ok")
             return
+
+        # v3.2: live Persian dubbing endpoints.
+        if parsed.path.startswith("/dub/"):
+            if dub_mod.handle_dub(self):
+                return
 
         if parsed.path == "/auth":
             self.handle_auth_get(query)
