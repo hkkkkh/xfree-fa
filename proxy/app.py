@@ -182,12 +182,12 @@ TRANSLATE_INJECT = (
     'if(s){s.value="fa";s.dispatchEvent(new Event("change"));'
     'clearInterval(t);}else if(n>30){clearInterval(t);}},500);'
     '}catch(e){}}</script>'
-    '<script src="https://xfree-fa-proxy.onrender.com/g/'
+    '<script async src="https://xfree-fa-proxy.onrender.com/g/'
     'translate.google.com/translate_a/element.js'
     '?cb=xfGoogleTranslateInit"></script>'
 )
 
-PROXY_VERSION = "3.2"
+PROXY_VERSION = "3.3"
 PROXY_BASE = "https://xfree-fa-proxy.onrender.com"
 
 # v3.2: every spelling of the two OAuth callback URLs that can

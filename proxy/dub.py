@@ -17,12 +17,16 @@ Nothing here needs a key, a login or a paid service:
             for a 2.5 s clip, POSTing raw 16-bit PCM (audio/l16) — no FLAC
             encoder needed. Without the key the endpoint answers
             400 "Missing parameter: key"; the v1 endpoint is 404-dead.
-  TRANSLATE Google Translate free web endpoint (translate.googleapis.com/
-            translate_a/single?client=gtx, no key). Verified live
-            2026-11-22: 200, "Hello world this is a test of speech" ->
-            "سلام دنیا این یک تست گفتار است", ~1.1 s. It 429s intermittently
-            under shared-IP load (datacenter IPs); the code retries with
-            backoff and /dub/health reports the live state.
+  TRANSLATE (v3.3 chain) Google Translate free gtx endpoint on
+            translate.googleapis.com, then gtx on translate.google.com,
+            then MyMemory (api.mymemory.translated.net, no key). Render's
+            shared egress IP times out on translate.googleapis.com gtx
+            (verified live 2026-11-22: 2x 10 s timeouts, while the same
+            call works from this VM), so one dead host must not kill
+            dubbing. A host that failed is skipped for 60 s. /dub/health
+            probes every candidate and reports which one works.
+            (Gemini was considered and ruled out: the Gemini key lives
+            in Muse's secure vault and cannot be put on Render.)
   TTS       Microsoft Edge Read-Aloud neural voices over WebSocket
             (speech.platform.bing.com, fa-IR-DilaraNeural female /
             fa-IR-FaridNeural male, no key, no login). The protocol needs
@@ -77,7 +81,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-DUB_VERSION = "1.0"
+DUB_VERSION = "1.1"
 
 # ----------------------------------------------------------------------
 # Tunables
@@ -87,6 +91,16 @@ SEGMENT_SAMPLE_RATE = 16000       # JS captures 16 kHz mono s16le
 SILENCE_RMS = 120                 # below this -> silent, skip STT entirely
 STT_TIMEOUT = 15
 TRANSLATE_TIMEOUT = 10
+# Per-candidate timeouts for the translate chain (v3.3): the chain
+# tries each host once; a host that failed is skipped for 60 s so a
+# dead host never stalls every segment.
+TRANSLATE_CANDIDATE_TIMEOUTS = {
+    "gtx-apis": 6,
+    "gtx-com": 6,
+    "mymemory": 8,
+}
+_TRANSLATE_DOWN = {}  # candidate -> unix time of last failure
+_LAST_TRANSLATE_ENGINE = None
 TTS_TIMEOUT = 30
 TTS_VOICE = "fa-IR-DilaraNeural"  # female default; see TTS_VOICE_FEMALE/MALE
 TTS_VOICE_FEMALE = "fa-IR-DilaraNeural"  # female Persian neural voice
@@ -547,27 +561,91 @@ def google_stt(pcm, lang, timeout=STT_TIMEOUT):
     return text, (sum(confs) / len(confs) if confs else 0.5)
 
 
-def google_translate(text, src, dst="fa", timeout=TRANSLATE_TIMEOUT):
-    """Free gtx endpoint. Retries on 429 (shared-IP rate limit).
-    Returns translated text, or None on failure."""
-    url = ("https://translate.googleapis.com/translate_a/single"
+def _translate_gtx_host(text, src, dst, host, timeout):
+    """One gtx attempt against one Google host. Text or None."""
+    url = ("https://%s/translate_a/single"
            "?client=gtx&sl=%s&tl=%s&dt=t&q=%s"
-           % (urllib.parse.quote(src), urllib.parse.quote(dst),
+           % (host, urllib.parse.quote(src), urllib.parse.quote(dst),
               urllib.parse.quote(text)))
-    last = None
-    for attempt in range(3):
-        try:
-            req = urllib.request.Request(url, headers={
-                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                               "AppleWebKit/537.36 (KHTML, like Gecko) "
-                               "Chrome/131.0.0.0 Safari/537.36")})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8", "replace"))
-            out = "".join(seg[0] for seg in data[0] if seg[0])
-            return out.strip() or None
-        except Exception as exc:  # noqa: BLE001 - retry then report None
-            last = exc
-            time.sleep(1.5 * (attempt + 1))
+    req = urllib.request.Request(url, headers={
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/131.0.0.0 Safari/537.36")})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8", "replace"))
+    out = "".join(seg[0] for seg in data[0] if seg[0])
+    return out.strip() or None
+
+
+def _translate_mymemory(text, src, dst, timeout=8):
+    """MyMemory free API (no key). Text or None. Returns None when
+    the shared-IP anonymous quota is finished (quotaFinished)."""
+    url = ("https://api.mymemory.translated.net/get?q=%s"
+           "&langpair=%s|%s"
+           % (urllib.parse.quote(text), urllib.parse.quote(src),
+              urllib.parse.quote(dst)))
+    req = urllib.request.Request(url, headers={
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/131.0.0.0 Safari/537.36")})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8", "replace"))
+    if data.get("responseStatus") != 200:
+        return None
+    rdata = data.get("responseData") or {}
+    if rdata.get("quotaFinished"):
+        return None
+    out = (rdata.get("translatedText") or "").strip()
+    if not out or "MYMEMORY WARNING" in out or "NO QUERY" in out:
+        return None
+    return out
+
+
+def _candidate_down(name):
+    return (time.time() - _TRANSLATE_DOWN.get(name, 0)) < 60
+
+
+def _translate_one(name, text, src, dst, timeout, force=False):
+    """One candidate, honouring the 60 s down-cache unless forced
+    (health probes force). Returns text or None."""
+    if not force and _candidate_down(name):
+        return None
+    try:
+        if name == "gtx-apis":
+            out = _translate_gtx_host(
+                text, src, dst, "translate.googleapis.com", timeout)
+        elif name == "gtx-com":
+            out = _translate_gtx_host(
+                text, src, dst, "translate.google.com", timeout)
+        elif name == "mymemory":
+            out = _translate_mymemory(text, src, dst, timeout)
+        else:
+            return None
+    except Exception:
+        out = None
+    if out:
+        _TRANSLATE_DOWN.pop(name, None)
+        return out
+    _TRANSLATE_DOWN[name] = time.time()
+    return None
+
+
+def google_translate(text, src, dst="fa", timeout=TRANSLATE_TIMEOUT):
+    """Translate via a fallback chain (v3.3). Render's shared egress
+    IP is rate-limited/timed-out on translate.googleapis.com gtx
+    (verified live 2026-11-22: 2x 10 s timeouts), so one dead host
+    must not kill dubbing: gtx on translate.googleapis.com, then
+    gtx on translate.google.com, then MyMemory (no key). Returns
+    translated text, or None when every candidate failed."""
+    global _LAST_TRANSLATE_ENGINE
+    for name in ("gtx-apis", "gtx-com", "mymemory"):
+        out = _translate_one(
+            name, text, src, dst,
+            TRANSLATE_CANDIDATE_TIMEOUTS[name])
+        if out:
+            _LAST_TRANSLATE_ENGINE = name
+            return out
+    _LAST_TRANSLATE_ENGINE = None
     return None
 
 
@@ -657,8 +735,10 @@ def detect_gender(pcm):
             round(f0, 1))
 
 
-def dub_segment(pcm, t0=0.0):
+def dub_segment(pcm, t0=0.0, want_tts=True):
     """One ~2 s PCM chunk -> dub result dict (JSON-safe).
+    want_tts=False skips TTS (subtitles-only path: the Persian text
+    comes back as soon as translation is ready, ~2 s faster).
     Never raises: failures come back as error fields, never a fake
     "dubbing" state."""
     t_start = time.time()
@@ -699,10 +779,22 @@ def dub_segment(pcm, t0=0.0):
     else:
         fa_text = google_translate(text, "en", "fa")
     timings["translate_ms"] = int((time.time() - t) * 1000)
+    timings["translate_engine"] = _LAST_TRANSLATE_ENGINE
     if not fa_text:
         return {"t0": t0, "silent": False, "source_text": text,
                 "fa_text": "", "audio_b64": None,
                 "error": "translate failed",
+                "ms": int((time.time() - t_start) * 1000),
+                "timings": timings}
+    if not want_tts:
+        # Subtitles-only: text is the product; no TTS round-trip.
+        return {"t0": t0, "silent": False, "source_text": text,
+                "source_lang": src_lang, "confidence": conf,
+                "fa_text": fa_text, "audio_b64": None,
+                "audio_dur": 0.0, "tts_engine": None,
+                "gender": gender, "f0_hz": f0_hz, "voice": voice,
+                "translate_engine": _LAST_TRANSLATE_ENGINE,
+                "error": None,
                 "ms": int((time.time() - t_start) * 1000),
                 "timings": timings}
     # 3. TTS: Edge neural Persian voice; Google TTS fallback;
@@ -728,6 +820,7 @@ def dub_segment(pcm, t0=0.0):
             "fa_text": fa_text, "audio_b64": audio_b64,
             "audio_dur": audio_dur, "tts_engine": tts_engine,
             "gender": gender, "f0_hz": f0_hz, "voice": voice,
+            "translate_engine": _LAST_TRANSLATE_ENGINE,
             "error": None if audio_b64 else "tts failed (text only)",
             "ms": int((time.time() - t_start) * 1000),
             "timings": timings}
@@ -766,7 +859,24 @@ def _probe_stt():
 
 
 def _probe_translate():
-    out = google_translate("Hello", "en", "fa", timeout=10)
+    """Probe every translate candidate (forced, bypassing the
+    down-cache) and report which host works from this machine."""
+    results = {}
+    for name in ("gtx-apis", "gtx-com", "mymemory"):
+        out = _translate_one(
+            name, "Hello", "en", "fa",
+            TRANSLATE_CANDIDATE_TIMEOUTS[name], force=True)
+        results[name] = bool(out)
+    ok = any(results.values())
+    detail = ",".join("%s:%s" % (k, "ok" if v else "fail")
+                      for k, v in results.items())
+    return ok, detail
+
+
+def _probe_translate_one(name):
+    out = _translate_one(
+        name, "Hello", "en", "fa",
+        TRANSLATE_CANDIDATE_TIMEOUTS[name], force=True)
     return bool(out), (out or "")
 
 
@@ -784,7 +894,16 @@ def dub_health():
             "dub_version": DUB_VERSION,
             "services": {
                 "stt_google_v2": _probe("stt", _probe_stt),
-                "translate_gtx": _probe("translate", _probe_translate),
+                "translate": _probe("translate", _probe_translate),
+                "translate_gtx": _probe(
+                    "translate_gtx",
+                    lambda: _probe_translate_one("gtx-apis")),
+                "translate_gtx_com": _probe(
+                    "translate_gtx_com",
+                    lambda: _probe_translate_one("gtx-com")),
+                "translate_mymemory": _probe(
+                    "translate_mymemory",
+                    lambda: _probe_translate_one("mymemory")),
                 "tts_edge_fa": _probe("tts", _probe_tts),
             },
             "notes": ("Google translate_tts tl=fa returns HTTP 400 "
@@ -792,8 +911,12 @@ def dub_health():
                       "Persian voice. STT uses the public Chromium demo "
                       "key, no private key anywhere."),
         }
-        data["ok"] = all(s["ok"]
-                         for s in data["services"].values())
+        # Overall ok = STT + at least one translate host + TTS.
+        # Individual candidate keys are diagnostic only.
+        data["ok"] = (
+            data["services"]["stt_google_v2"]["ok"]
+            and data["services"]["translate"]["ok"]
+            and data["services"]["tts_edge_fa"]["ok"])
         _HEALTH_CACHE["at"] = time.time()
         _HEALTH_CACHE["data"] = data
         return data
@@ -829,6 +952,8 @@ def handle_dub(handler):
             t0 = float((query.get("t0") or ["0"])[0])
         except ValueError:
             t0 = 0.0
+        # ?tts=0 skips TTS (subtitles-only: text back sooner).
+        want_tts = (query.get("tts") or ["1"])[0] != "0"
         ctype = (handler.headers.get("Content-Type") or "")
         if "application/json" in ctype:
             try:
@@ -841,7 +966,7 @@ def handle_dub(handler):
                 return True
         else:
             pcm = raw
-        result = dub_segment(pcm, t0)
+        result = dub_segment(pcm, t0, want_tts=want_tts)
         _send_json(handler, 200, json.dumps(
             result, ensure_ascii=False).encode("utf-8"))
         return True
