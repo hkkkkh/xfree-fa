@@ -91,7 +91,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-DUB_VERSION = "1.6"
+DUB_VERSION = "1.7"
 
 # v3.4: DUBBING IS DEAD — the app is subtitles-only now (user order).
 # Root cause of dead translate: Render's SHARED egress IP is burned
@@ -360,7 +360,7 @@ def _edge_muid():
 # The Render host has no egress proxy; this VM does (https_proxy env),
 # so the tunnel path is exercised here and skipped on Render.
 # ======================================================================
-def _ws_connect(host, path, headers, timeout=30):
+def _ws_connect(host, path, headers, timeout=30, safe_error=False):
     proxy = (os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
              or "")
     if proxy:
@@ -394,6 +394,12 @@ def _ws_connect(host, path, headers, timeout=30):
             raise RuntimeError("websocket handshake: connection closed")
         resp += chunk
     if b"101" not in resp.split(b"\r\n")[0]:
+        # safe_error: never include the response body in the
+        # exception — for the Gemini bridge the handshake request
+        # carries the API key, and a server error body must never
+        # be able to leak anything key-related into a log.
+        if safe_error:
+            raise RuntimeError("websocket handshake failed")
         raise RuntimeError("websocket handshake failed: %s"
                            % resp[:200].decode("utf-8", "replace"))
     return sock
@@ -998,6 +1004,15 @@ def dub_health():
                     "translate_mymemory",
                     lambda: _probe_translate_one("mymemory")),
                 "tts_edge_fa": _probe("tts", _probe_tts),
+                # v3.7: boolean only — the key is never probed, never
+                # logged, never returned. "ok" here means configured.
+                "gemini_live": {
+                    "ok": gemini_configured(),
+                    "detail": ("configured (GEMINI_API_KEY set)"
+                               if gemini_configured() else
+                               "not configured — set GEMINI_API_KEY "
+                               "in the Render dashboard"),
+                },
             },
             "notes": ("Google translate_tts tl=fa returns HTTP 400 "
                       "(verified 2026-11-22); Edge neural TTS is the "
@@ -1028,6 +1043,19 @@ def handle_dub(handler):
     if parsed.path == "/dub/ws" and handler.command == "GET":
         # v3.6: WebSocket live subtitles (streaming transport).
         handle_dub_ws(handler)
+        return True
+    if parsed.path == "/dub/gemini-ws" and handler.command == "GET":
+        # v3.7: Gemini Live Translate relay (server-side key).
+        handle_dub_gemini_ws(handler)
+        return True
+    if parsed.path == "/dub/gemini-status" and handler.command == "GET":
+        # v3.7: only a boolean — the key is NEVER returned, logged
+        # or echoed anywhere.
+        body = json.dumps({
+            "configured": gemini_configured(),
+            "model": _GEMINI_MODEL,
+        }).encode("utf-8")
+        _send_json(handler, 200, body)
         return True
     if parsed.path == "/dub/health" and handler.command == "GET":
         body = json.dumps(dub_health(), ensure_ascii=False).encode("utf-8")
@@ -1360,6 +1388,302 @@ def handle_dub_ws(handler):
     finally:
         state["closed"] = True
         executor.shutdown(wait=False, cancel_futures=True)
+        try:
+            sock.close()
+        except Exception:
+            pass
+        handler.close_connection = True
+
+
+# ======================================================================
+# v3.7 Gemini Live Translate relay: GET /dub/gemini-ws (upgrade).
+#
+# SECURITY (user order 2026-11-22: "save the key on the server,
+# think of the security"): the user's Gemini API key lives ONLY as
+# the GEMINI_API_KEY environment variable on the Render service
+# (render.yaml declares it sync:false, so it is set in the Render
+# dashboard and never lands in git). The proxy reads it from the
+# environment at runtime and uses it ONLY for this Gemini Live
+# subtitle translation. The key is NEVER baked into the APK, NEVER
+# sent to any client, NEVER written to any file, NEVER logged, and
+# NEVER returned by any endpoint — /dub/gemini-status and
+# /dub/health report only the boolean "configured". The app does
+# NOT store the key and has NO key field. The handshake request
+# carries the key in its query string, so the URL is never logged
+# and handshake failures are raised with safe_error=True (no
+# response body in the exception).
+#
+# METHOD (verified live 2026-11-22 in v3.6 research, same as Namia
+# / LivDub): capture the video's own audio -> stream 16 kHz PCM16
+# over WebSocket to Google Gemini Live Translate
+# (gemini-3.5-live-translate-preview, translationConfig target fa)
+# -> simultaneous Persian captions back (~3 s behind speech).
+# The proxy bridges the app's WS to Gemini's WS; the app falls
+# back to /dub/ws (or HTTP /dub/stt) whenever this bridge is
+# unavailable or unconfigured, so subtitles still work with NO
+# key at all — the Gemini path is an upgrade, not a dependency.
+# ======================================================================
+_GEMINI_HOST = "generativelanguage.googleapis.com"
+_GEMINI_MODEL = "models/gemini-3.5-live-translate-preview"
+_GEMINI_WS_PATH = ("/ws/google.ai.generativelanguage.v1beta."
+                   "GenerativeService.BidiGenerateContent")
+_GEMINI_SETUP = {
+    "setup": {
+        "model": _GEMINI_MODEL,
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "translationConfig": {
+                "targetLanguageCode": "fa",
+                "echoTargetLanguage": True,
+            },
+        },
+        "inputAudioTranscription": {},
+        "outputAudioTranscription": {},
+    },
+}
+_GEMINI_MAX_IDLE = 90  # close a dead connection after 90 s
+
+
+def gemini_key():
+    """Read the key from the environment only. The value is never
+    logged, never returned, never stored anywhere else."""
+    return (os.environ.get("GEMINI_API_KEY") or "").strip()
+
+
+def gemini_configured():
+    return bool(gemini_key())
+
+
+def _gemini_parse_out(text):
+    """Extract (fa_text, turn_complete) from one Gemini Live JSON
+    message. Returns (None, False) when the message carries no
+    output transcription."""
+    try:
+        msg = json.loads(text)
+    except Exception:
+        return None, False
+    if not isinstance(msg, dict):
+        return None, False
+    sc = msg.get("serverContent") or {}
+    if not isinstance(sc, dict):
+        return None, False
+    ot = sc.get("outputTranscription") or {}
+    fa = ot.get("text") if isinstance(ot, dict) else None
+    done = bool(sc.get("turnComplete"))
+    if fa:
+        return str(fa), done
+    return None, done
+
+
+def handle_dub_gemini_ws(handler):
+    """Bridge app WS <-> Gemini Live WS. Runs inside the handler
+    thread until either side closes or 90 s idle."""
+    key = handler.headers.get("Sec-WebSocket-Key") or ""
+    accept = base64.b64encode(hashlib.sha1(
+        (key + _WS_GUID).encode("ascii")).digest()).decode("ascii")
+    handler.send_response(101, "Switching Protocols")
+    handler.send_header("Upgrade", "websocket")
+    handler.send_header("Connection", "Upgrade")
+    handler.send_header("Sec-WebSocket-Accept", accept)
+    handler.end_headers()
+    sock = handler.connection
+    sock.settimeout(5)
+    send_lock = threading.Lock()
+    gsend_lock = threading.Lock()  # serialises writes to the Gemini socket
+    state = {"closed": False, "last_rx": time.time(),
+             "mark_t0": 0.0, "last_final": "", "last_sent": ""}
+
+    def _send(obj):
+        if state["closed"]:
+            return
+        try:
+            _ws_send_json(sock, send_lock, obj)
+        except Exception:
+            state["closed"] = True
+
+    if not gemini_configured():
+        # No key on the server yet — tell the app so it falls back
+        # to the no-key path instead of hanging.
+        _send({"type": "error", "error": "gemini_not_configured"})
+        try:
+            _ws_send_frame(sock, send_lock, b"", opcode=0x8)
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+        handler.close_connection = True
+        return
+
+    # --- open the Gemini Live session (key in memory only) ---
+    gsock = None
+    try:
+        # The path carries the key; it is NEVER logged.
+        path = (_GEMINI_WS_PATH + "?key="
+                + urllib.parse.quote(gemini_key(), safe=""))
+        gsock = _ws_connect(_GEMINI_HOST, path, {}, timeout=15,
+                            safe_error=True)
+        gsock.settimeout(30)
+        _ws_send_text(gsock, json.dumps(_GEMINI_SETUP))
+        # Wait for setupComplete (<= 10 s).
+        got_setup = False
+        end = time.time() + 10
+        gsock.settimeout(max(1.0, end - time.time()))
+        while time.time() < end:
+            try:
+                op, payload = _ws_recv_frame(gsock)
+            except socket.timeout:
+                continue
+            if op in (0x1, 0x2) and payload:
+                try:
+                    m = json.loads(payload.decode("utf-8"))
+                except Exception:
+                    continue
+                if isinstance(m, dict) and "setupComplete" in m:
+                    got_setup = True
+                    break
+                if isinstance(m, dict) and "error" in m:
+                    break
+        gsock.settimeout(30)
+        if not got_setup:
+            raise RuntimeError("gemini setup not completed")
+    except Exception:
+        # Generic error only — never the exception text (it could
+        # carry server response bytes) and never the key.
+        _send({"type": "error", "error": "gemini_error"})
+        try:
+            _ws_send_frame(sock, send_lock, b"", opcode=0x8)
+        except Exception:
+            pass
+        if gsock is not None:
+            try:
+                gsock.close()
+            except Exception:
+                pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+        handler.close_connection = True
+        return
+
+    def _gemini_reader():
+        """Gemini -> app: Persian captions out of outputTranscription."""
+        try:
+            while not state["closed"]:
+                try:
+                    op, payload = _ws_recv_frame(gsock)
+                except (EOFError, OSError, socket.timeout):
+                    break
+                if state["closed"]:
+                    break
+                if op == 0x8:  # close
+                    break
+                if op == 0x9:  # ping -> pong
+                    try:
+                        # _ws_send_frame locks internally; do NOT
+                        # wrap it in gsend_lock (deadlock).
+                        _ws_send_frame(gsock, gsend_lock, b"",
+                                       opcode=0xA)
+                    except Exception:
+                        break
+                    continue
+                if op == 0xA:  # pong
+                    continue
+                if op not in (0x1, 0x2) or not payload:
+                    continue
+                try:
+                    text = payload.decode("utf-8")
+                except Exception:
+                    continue
+                fa, done = _gemini_parse_out(text)
+                if not fa:
+                    continue
+                fa = fa.strip()
+                if not fa or fa == state["last_sent"]:
+                    continue  # dedup: same line twice
+                state["last_sent"] = fa
+                if done:
+                    norm = " ".join(fa.lower().split())
+                    if norm == state["last_final"]:
+                        continue
+                    state["last_final"] = norm
+                    _send({"type": "final", "t0": round(
+                        state["mark_t0"], 2), "text": fa, "lang": "fa"})
+                else:
+                    _send({"type": "interim", "t0": round(
+                        state["mark_t0"], 2), "text": fa, "lang": "fa"})
+        except Exception:
+            pass
+        finally:
+            if not state["closed"]:
+                _send({"type": "error", "error": "gemini_closed"})
+            state["closed"] = True
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+
+    reader = threading.Thread(target=_gemini_reader, daemon=True)
+    reader.start()
+    try:
+        while not state["closed"]:
+            try:
+                op, payload = _ws_recv_frame(sock)
+            except socket.timeout:
+                if time.time() - state["last_rx"] > _GEMINI_MAX_IDLE:
+                    break
+                try:
+                    _ws_send_frame(sock, send_lock, b"", opcode=0x9)
+                except Exception:
+                    break
+                continue
+            except (EOFError, OSError):
+                break
+            state["last_rx"] = time.time()
+            if op == 0x8:  # close
+                try:
+                    _ws_send_frame(sock, send_lock, payload, opcode=0x8)
+                except Exception:
+                    pass
+                break
+            if op == 0x9:  # ping -> pong
+                try:
+                    _ws_send_frame(sock, send_lock, payload, opcode=0xA)
+                except Exception:
+                    break
+                continue
+            if op == 0xA:  # pong
+                continue
+            if op == 0x1 and payload:  # text control: mark t0
+                try:
+                    msg = json.loads(payload.decode("utf-8"))
+                    if msg.get("op") == "mark":
+                        state["mark_t0"] = float(msg.get("t0") or 0.0)
+                except Exception:
+                    pass
+                continue
+            if op == 0x2 and payload:  # binary PCM s16le 16 kHz mono
+                try:
+                    # _ws_send_text does a single sendall with no
+                    # internal lock, so serialise it here.
+                    with gsend_lock:
+                        _ws_send_text(gsock, json.dumps({
+                            "realtimeInput": {"audio": {
+                                "mimeType": "audio/pcm;rate=16000",
+                                "data": base64.b64encode(
+                                    payload).decode("ascii"),
+                            }},
+                        }))
+                except Exception:
+                    break
+    finally:
+        state["closed"] = True
+        try:
+            gsock.close()
+        except Exception:
+            pass
         try:
             sock.close()
         except Exception:

@@ -10,3 +10,12 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.0
+      # v3.7: Gemini Live subtitle key. sync:false = the value is
+      # managed ONLY in the Render dashboard (Environment tab) and
+      # never lands in git, never in the APK, never in any file.
+      # The proxy reads it from the environment at runtime and
+      # uses it ONLY for the Gemini Live subtitle relay
+      # (/dub/gemini-ws). Without it, subtitles fall back to the
+      # no-key path and keep working.
+      - key: GEMINI_API_KEY
+        sync: false
