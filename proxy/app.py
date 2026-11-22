@@ -17,6 +17,19 @@ Endpoints (all GET unless noted):
   /video?u=<mp4 url>    video file, streamed from cdn.xfree.com with
                      HTTP Range passthrough (206), so VideoView seeking
                      and DownloadManager resume work.
+  /* (any other path)  v2.6 REVERSE PROXY for the WebView app: the whole
+                     site served from this origin, so the real xfree.com
+                     runs inside the app without VPN:
+                     GET /_nuxt/..., /api/..., /video?id=..., /playlist,
+                     /search, /<username> ... are forwarded to
+                     https://www.xfree.com + path, with Cookie /
+                     apiversion / Set-Cookie forwarded, absolute
+                     www/thumbs/cdn URLs rewritten to this proxy, and
+                     redirects rewritten to this origin. POSTs to /api/*
+                     are forwarded the same way (login, follow, ...).
+                     /page, /img, /video?u=, /auth, /upload, /diag keep
+                     their old behaviour; /video without ?u= and
+                     /upload (GET) are site pages, not relays.
   POST /auth         v2.4 JSON relay for login/signup: body
                      {"url": "https://www.xfree.com/api/...", "body": {...},
                       "cookies": "anonymous=...; authorization=..."}
@@ -75,7 +88,7 @@ ALLOWED_HOSTS = {
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-PROXY_VERSION = "2.4"
+PROXY_VERSION = "2.6"
 
 # v1.9: 900s TTL — the keep-alive pings /page every 12 min, so the
 # cache must outlive the ping interval or the home page is cold again.
@@ -201,7 +214,29 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/upload":
             self.handle_upload(query, raw)
             return
-        self.send_text(404, "not found")
+        # v2.6: any other POST (e.g. /api/login, /api/follow) goes
+        # through the reverse proxy to the real site.
+        self.handle_reverse_proxy(parsed, raw,
+                                  self.headers.get("Content-Type"))
+
+    def do_PUT(self):
+        self._do_write_method()
+
+    def do_DELETE(self):
+        self._do_write_method()
+
+    def do_PATCH(self):
+        self._do_write_method()
+
+    def _do_write_method(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length > 0 else b""
+        parsed = urllib.parse.urlparse(self.path)
+        self.handle_reverse_proxy(parsed, raw,
+                                  self.headers.get("Content-Type"))
 
     def handle_auth(self, raw):
         """POST /auth {"url": ..., "body": {...}, "cookies": "...",
@@ -383,6 +418,160 @@ class Handler(BaseHTTPRequestHandler):
                           "setCookie": set_cookie})
         self.send_text(200, out, "application/json; charset=utf-8")
 
+    # -- v2.6 reverse proxy (whole site through this origin) ---------
+    def _rewrite_location(self, loc):
+        """A redirect to www.xfree.com must stay on this proxy origin,
+        or the WebView would navigate straight to the filtered site."""
+        if not loc:
+            return loc
+        for host in ("https://www.xfree.com", "https://xfree.com",
+                     "http://www.xfree.com", "http://xfree.com",
+                     "//www.xfree.com", "//xfree.com"):
+            if loc.startswith(host):
+                return loc[len(host):] or "/"
+        return loc
+
+    def _rewrite_body(self, body, ctype):
+        """Rewrite absolute site URLs in text bodies so subresources
+        stay on the proxy origin instead of the filtered hosts.
+        Only for text/* and JS/JSON; binary bodies pass through."""
+        if not body or not ctype:
+            return body
+        low = ctype.lower()
+        if not (low.startswith("text/") or "javascript" in low
+                or "json" in low or "xml" in low):
+            return body
+        try:
+            text = body.decode("utf-8")
+        except Exception:
+            return body
+        import re
+        base = "https://xfree-fa-proxy.onrender.com"
+        # thumbs/cdn absolute URLs -> proxy /img / /video relays
+        def _thumb(m):
+            u = m.group(0)
+            return base + "/img?u=" + urllib.parse.quote(u, safe="")
+        def _cdn(m):
+            u = m.group(0)
+            return base + "/video?u=" + urllib.parse.quote(u, safe="")
+        text = re.sub(r"https://thumbs\.xfree\.com/[^\s\"'<>]+", _thumb, text)
+        text = re.sub(r"https://cdn\.xfree\.com/[^\s\"'<>]+", _cdn, text)
+        text = text.replace("https://www.xfree.com", base)
+        text = text.replace("https://xfree.com", base)
+        text = text.replace("//www.xfree.com", "//xfree-fa-proxy.onrender.com")
+        text = text.replace("//xfree.com", "//xfree-fa-proxy.onrender.com")
+        return text.encode("utf-8")
+
+    def handle_reverse_proxy(self, parsed, raw=b"", content_type=None):
+        """Forward any other path/method to https://www.xfree.com
+        and return the upstream response verbatim (status, headers,
+        Set-Cookie, body). Direct first; for an HTML GET that comes
+        back as a Cloudflare challenge, fall back to Jina like
+        /page does. No caching here — API/session responses must
+        never be served stale."""
+        path = parsed.path
+        if path.startswith("/site/"):
+            path = path[5:] or "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        target = "https://www.xfree.com" + path
+        if parsed.query:
+            target += "?" + parsed.query
+        headers = {"User-Agent": UA}
+        for name in ("Accept", "Accept-Language", "Range", "If-Range"):
+            value = self.headers.get(name)
+            if value:
+                headers[name] = value
+        cookies = self.headers.get("Cookie")
+        if cookies:
+            headers["Cookie"] = cookies
+        if path.startswith("/api"):
+            headers["apiversion"] = "1.0"
+            headers["language"] = "en"
+        origin = self.headers.get("Origin") or ""
+        if origin.startswith("https://xfree-fa-proxy.onrender.com"):
+            origin = "https://www.xfree.com"
+        headers["Origin"] = origin or "https://www.xfree.com"
+        referer = self.headers.get("Referer") or ""
+        if referer.startswith("https://xfree-fa-proxy.onrender.com"):
+            referer = "https://www.xfree.com/" + referer[len(
+                "https://xfree-fa-proxy.onrender.com/"):]
+        headers["Referer"] = referer or "https://www.xfree.com/"
+        if content_type:
+            headers["Content-Type"] = content_type
+        method = self.command
+        status = 502
+        body = b"upstream failed"
+        resp_headers = {}
+        set_cookie = []
+        try:
+            req = urllib.request.Request(target, data=raw or None,
+                                         headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                status = resp.status
+                body = resp.read(25 * 1024 * 1024)
+                resp_headers = dict(resp.headers.items())
+                set_cookie = resp.headers.get_all("Set-Cookie") or []
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            try:
+                body = exc.read(25 * 1024 * 1024)
+            except Exception:
+                body = b""
+            resp_headers = dict(exc.headers.items())
+            set_cookie = exc.headers.get_all("Set-Cookie") or []
+        except Exception as exc:
+            body = ("upstream failed: %s" % exc).encode("utf-8")
+            status = 502
+        # HTML GET that got a challenge page: retry via Jina (same
+        # fallback as /page) instead of serving the challenge.
+        if (method == "GET"
+                and not looks_like_page(body)
+                and len(body) >= 1000):
+            try:
+                jina_url = "https://r.jina.ai/" + target
+                req = urllib.request.Request(
+                    jina_url,
+                    headers={"User-Agent": UA,
+                             "X-Return-Format": "html"},
+                    method="GET")
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    cand = resp.read(25 * 1024 * 1024)
+                    if looks_like_page(cand):
+                        body = cand
+                        status = 200
+                        resp_headers = {"Content-Type":
+                                        "text/html; charset=utf-8"}
+                        set_cookie = []
+            except Exception:
+                pass
+        ctype = resp_headers.get("Content-Type") or ""
+        body = self._rewrite_body(body, ctype)
+        if ctype.startswith("text/html") and not looks_like_page(body) \
+                and status == 200 and len(body) >= 1000:
+            # Still a challenge page after Jina: do not pretend it
+            # is the site — report the real failure.
+            status = 502
+            body = b"upstream blocked (challenge page)"
+        self.send_response(status)
+        if ctype:
+            self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for name in ("Cache-Control", "Content-Range", "Accept-Ranges",
+                     "Content-Disposition", "ETag"):
+            if resp_headers.get(name):
+                self.send_header(name, resp_headers[name])
+        loc = resp_headers.get("Location")
+        if loc:
+            self.send_header("Location", self._rewrite_location(loc))
+        for cookie in set_cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("X-Proxy-Version", PROXY_VERSION)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        if self.command != "HEAD" and method != "HEAD":
+            self.wfile.write(body)
+
     def handle_all(self):
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
@@ -408,10 +597,19 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/video":
-            self.handle_binary(query, "video")
+            # ?u=... is the mp4 relay; anything else (/video?id=...)
+            # is a site page through the reverse proxy.
+            if (query.get("u") or [""])[0]:
+                self.handle_binary(query, "video")
+                return
+            self.handle_reverse_proxy(parsed)
             return
 
-        self.send_text(404, "not found")
+        # v2.6: everything else is the real site, served from this
+        # origin (/_nuxt/..., /api/..., /playlist, /search,
+        # /<username>, ...). Unknown paths are NOT invented — the
+        # upstream status/body is returned verbatim.
+        self.handle_reverse_proxy(parsed)
 
     def send_cached_page(self, body, ctype, hit=True):
         self.send_response(200)
