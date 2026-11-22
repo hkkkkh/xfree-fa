@@ -576,7 +576,10 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
 
-        if parsed.path in ("/", "/health"):
+        # v2.6: "/" IS the site homepage for the WebView app (the
+        # WebView loads the proxy origin as if it were xfree.com).
+        # Health moved to /health only, so the root is not "ok" text.
+        if parsed.path in ("/health",):
             self.send_text(200, "ok")
             return
 
