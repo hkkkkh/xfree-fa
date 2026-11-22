@@ -17,10 +17,17 @@ Endpoints (all GET unless noted):
   /video?u=<mp4 url>    video file, streamed from cdn.xfree.com with
                      HTTP Range passthrough (206), so VideoView seeking
                      and DownloadManager resume work.
-  POST /auth         v2.3 JSON relay for login/signup: body
-                     {"url": "https://www.xfree.com/api/...", "body": {...}}
-                     -> {"status": <upstream code>, "body": "<text>"}
+  POST /auth         v2.4 JSON relay for login/signup: body
+                     {"url": "https://www.xfree.com/api/...", "body": {...},
+                      "cookies": "anonymous=...; authorization=..."}
+                     -> {"status": <upstream code>, "body": "<text>",
+                         "setCookie": [...]}
                      Only xfree.com / www.xfree.com are allowed.
+                     Forwards Cookie/Origin/Referer; returns upstream
+                     Set-Cookie (v2.3 dropped them, so login could
+                     never keep a session).
+  GET  /auth?url=... v2.4 GET relay for cookie-authenticated calls
+                     (e.g. GET /api/user/<userId>), same response shape.
   POST /upload?url=<upload host>   v2.3 raw relay for video uploads:
                      forwards the multipart body + Content-Type +
                      Authorization to upload.xfree.com and returns the
@@ -68,7 +75,7 @@ ALLOWED_HOSTS = {
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-PROXY_VERSION = "2.3"
+PROXY_VERSION = "2.4"
 
 # v1.9: 900s TTL — the keep-alive pings /page every 12 min, so the
 # cache must outlive the ping interval or the home page is cold again.
@@ -197,13 +204,23 @@ class Handler(BaseHTTPRequestHandler):
         self.send_text(404, "not found")
 
     def handle_auth(self, raw):
-        """POST /auth {"url": ..., "body": {...}} -> upstream JSON POST.
-        Only xfree.com / www.xfree.com targets are allowed."""
+        """POST /auth {"url": ..., "body": {...}, "cookies": "...",
+        "origin": "...", "referer": "..."} -> upstream JSON POST.
+        Only xfree.com / www.xfree.com targets are allowed.
+        v2.4: forwards the app's Cookie header (the site's login flow
+        is cookie-based: POST /api/anonymous-login first, then
+        POST /api/login with that cookie — bundle 6347c71.js) and
+        returns upstream Set-Cookie headers in "setCookie", because
+        without them the session is lost. Nothing is invented: the
+        upstream status/body/cookies are returned verbatim."""
         try:
             import json
             payload = json.loads(raw.decode("utf-8"))
             target = payload.get("url") or ""
             body = payload.get("body") or {}
+            cookies = payload.get("cookies") or ""
+            origin = payload.get("origin") or ""
+            referer = payload.get("referer") or ""
         except Exception as exc:
             self.send_text(400, "bad json: %s" % exc)
             return
@@ -212,26 +229,75 @@ class Handler(BaseHTTPRequestHandler):
                 or not target.startswith("https://"):
             self.send_text(403, "disallowed auth target")
             return
+        headers = {"User-Agent": UA,
+                   "Content-Type": "application/json",
+                   "Accept": "application/json",
+                   "Origin": "https://www.xfree.com",
+                   "Referer": "https://www.xfree.com/"}
+        if cookies:
+            headers["Cookie"] = cookies
+        if origin:
+            headers["Origin"] = origin
+        if referer:
+            headers["Referer"] = referer
         try:
             import json
             req = urllib.request.Request(
                 target,
                 data=json.dumps(body).encode("utf-8"),
-                headers={"User-Agent": UA,
-                         "Content-Type": "application/json",
-                         "Accept": "application/json"},
+                headers=headers,
                 method="POST")
             with urllib.request.urlopen(req, timeout=30) as resp:
                 upstream_body = resp.read(20000).decode("utf-8", "replace")
                 status = resp.status
+                set_cookie = resp.headers.get_all("Set-Cookie") or []
         except urllib.error.HTTPError as exc:
             upstream_body = exc.read(20000).decode("utf-8", "replace")
             status = exc.code
+            set_cookie = exc.headers.get_all("Set-Cookie") or []
         except Exception as exc:
             self.send_text(502, "upstream failed: %s" % exc)
             return
         import json
-        out = json.dumps({"status": status, "body": upstream_body})
+        out = json.dumps({"status": status, "body": upstream_body,
+                          "setCookie": set_cookie})
+        self.send_text(200, out, "application/json; charset=utf-8")
+
+    def handle_auth_get(self, query):
+        """GET /auth?url=https://www.xfree.com/api/... — same relay
+        for GET calls that need the session cookie (e.g. the site's
+        loadMyInfo: GET /api/user/<userId>, bundle 6347c71.js).
+        Cookie header of the phone is forwarded; upstream Set-Cookie
+        headers are returned in "setCookie"."""
+        target = (query.get("url") or [""])[0]
+        host = urllib.parse.urlparse(target).hostname or ""
+        if host not in ("www.xfree.com", "xfree.com") \
+                or not target.startswith("https://"):
+            self.send_text(403, "disallowed auth target")
+            return
+        headers = {"User-Agent": UA, "Accept": "application/json",
+                   "Origin": "https://www.xfree.com",
+                   "Referer": "https://www.xfree.com/"}
+        cookies = self.headers.get("Cookie")
+        if cookies:
+            headers["Cookie"] = cookies
+        try:
+            req = urllib.request.Request(target, headers=headers,
+                                         method="GET")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                upstream_body = resp.read(20000).decode("utf-8", "replace")
+                status = resp.status
+                set_cookie = resp.headers.get_all("Set-Cookie") or []
+        except urllib.error.HTTPError as exc:
+            upstream_body = exc.read(20000).decode("utf-8", "replace")
+            status = exc.code
+            set_cookie = exc.headers.get_all("Set-Cookie") or []
+        except Exception as exc:
+            self.send_text(502, "upstream failed: %s" % exc)
+            return
+        import json
+        out = json.dumps({"status": status, "body": upstream_body,
+                          "setCookie": set_cookie})
         self.send_text(200, out, "application/json; charset=utf-8")
 
     def handle_upload(self, query, raw):
@@ -282,6 +348,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path in ("/", "/health"):
             self.send_text(200, "ok")
+            return
+
+        if parsed.path == "/auth":
+            self.handle_auth_get(query)
             return
 
         if parsed.path == "/page":
