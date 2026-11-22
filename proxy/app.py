@@ -187,7 +187,7 @@ TRANSLATE_INJECT = (
     '?cb=xfGoogleTranslateInit"></script>'
 )
 
-PROXY_VERSION = "3.4"
+PROXY_VERSION = "3.5"
 PROXY_BASE = "https://xfree-fa-proxy.onrender.com"
 
 # v3.2: every spelling of the two OAuth callback URLs that can
@@ -620,6 +620,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
+        # v3.5 ROOT FIX: /dub/* must be routed BEFORE the body is
+        # read. do_POST used to read rfile here and then
+        # dub_mod.handle_dub() read rfile AGAIN — the second read
+        # blocked forever on a keep-alive connection (body already
+        # consumed), so POST /dub/stt and /dub/translate hung until
+        # timeout while GET /dub/health worked fine. Local smoke
+        # tests passed because dub.py's standalone server calls
+        # handle_dub directly without pre-reading. handle_dub reads
+        # the body itself, so it must run first.
+        if parsed.path.startswith("/dub/"):
+            if dub_mod.handle_dub(self):
+                return
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -629,10 +641,6 @@ class Handler(BaseHTTPRequestHandler):
             return
         raw = self.rfile.read(length) if length > 0 else b""
 
-        # v3.2: live Persian dubbing endpoints.
-        if parsed.path.startswith("/dub/"):
-            if dub_mod.handle_dub(self):
-                return
         if parsed.path.startswith("/g/"):
             self.handle_generic_relay(parsed, raw,
                                       self.headers.get("Content-Type"))
