@@ -91,7 +91,21 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-DUB_VERSION = "1.3"
+DUB_VERSION = "1.4"
+
+# v3.4: DUBBING IS DEAD — the app is subtitles-only now (user order).
+# Root cause of dead translate: Render's SHARED egress IP is burned
+# for every free translate API (Google 302s both gtx hosts to
+# /sorry/index; MyMemory 429s — the 50k chars/day/IP quota is shared
+# by every service on that IP). The fix is architectural, not another
+# candidate: translation now happens ON THE PHONE (the app fetches
+# gtx/MyMemory directly from the user's own mobile IP, which is not
+# burned — Chrome page-translate on the same phone already proves
+# the phone reaches Google Translate). The proxy only does STT
+# (which works fine from Render, ~140 ms) via the new /dub/stt
+# endpoint; /dub/translate remains as a last-resort fallback for the
+# phone. /dub/segment (dub pipeline) is kept for compatibility but
+# the app no longer calls it and no TTS audio is ever produced.
 
 # ----------------------------------------------------------------------
 # Tunables
@@ -846,6 +860,65 @@ def dub_segment(pcm, t0=0.0, want_tts=True):
 
 
 # ======================================================================
+# v3.4 subtitles-only endpoints: /dub/stt (STT only, no translate,
+# no TTS) and /dub/translate (last-resort server translate).
+# The app flow is: capture PCM -> /dub/stt -> translate ON THE
+# PHONE (gtx/MyMemory direct from the user's IP) -> subtitle overlay.
+# Original audio is never touched: no ducking, no muting, no TTS.
+# ======================================================================
+def stt_only(pcm, t0=0.0):
+    """One ~2 s PCM chunk -> {source_text, source_lang, ...}.
+    STT only: no translate, no TTS. Never raises."""
+    t_start = time.time()
+    timings = {}
+    if len(pcm) > SEGMENT_MAX_SECONDS * SEGMENT_SAMPLE_RATE * 2:
+        return {"t0": t0, "error": "segment too long",
+                "silent": False, "source_text": ""}
+    rms = _pcm_rms(pcm)
+    if rms < SILENCE_RMS:
+        return {"t0": t0, "silent": True, "source_text": "",
+                "source_lang": "", "confidence": 0.0,
+                "ms": int((time.time() - t_start) * 1000)}
+    t = time.time()
+    text, conf = google_stt(pcm, "en-US")
+    src_lang = "en"
+    if text == "":
+        text, conf = google_stt(pcm, "fa-IR")
+        src_lang = "fa"
+    timings["stt_ms"] = int((time.time() - t) * 1000)
+    if text is None or text == "":
+        return {"t0": t0, "silent": False, "source_text": "",
+                "source_lang": src_lang, "confidence": 0.0,
+                "error": "no speech recognised" if text == ""
+                         else "stt failed",
+                "ms": int((time.time() - t_start) * 1000),
+                "timings": timings}
+    return {"t0": t0, "silent": False, "source_text": text,
+            "source_lang": src_lang, "confidence": conf,
+            "error": None,
+            "ms": int((time.time() - t_start) * 1000),
+            "timings": timings}
+
+
+def translate_only(text, src="en", dst="fa"):
+    """Server-side translate (last resort for the phone). Uses the
+    same chain as before; from Render it is usually 429 (shared
+    egress IP burned) — the phone's direct gtx call is the real
+    path. Returns {fa_text, engine, error}."""
+    if not text or not text.strip():
+        return {"fa_text": "", "engine": None, "error": "empty text"}
+    if src == dst:
+        return {"fa_text": text, "engine": "none",
+                "error": None}
+    out = google_translate(text, src, dst)
+    if out:
+        return {"fa_text": out, "engine": _LAST_TRANSLATE_ENGINE,
+                "error": None}
+    return {"fa_text": "", "engine": None,
+            "error": "translate failed"}
+
+
+# ======================================================================
 # /dub/health — live probe of each free service (cached 60 s).
 # ======================================================================
 _HEALTH_CACHE = {"at": 0.0, "data": None}
@@ -955,6 +1028,65 @@ def handle_dub(handler):
     if parsed.path == "/dub/health" and handler.command == "GET":
         body = json.dumps(dub_health(), ensure_ascii=False).encode("utf-8")
         _send_json(handler, 200, body)
+        return True
+    if parsed.path == "/dub/stt" and handler.command == "POST":
+        # v3.4 subtitles-only: PCM -> transcript, no translate/TTS.
+        try:
+            length = int(handler.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 4 * 1024 * 1024:
+            _send_json(handler, 400, json.dumps(
+                {"error": "empty or too large body"}).encode("utf-8"))
+            return True
+        raw = handler.rfile.read(length)
+        query = urllib.parse.parse_qs(parsed.query)
+        t0 = 0.0
+        try:
+            t0 = float((query.get("t0") or ["0"])[0])
+        except ValueError:
+            t0 = 0.0
+        ctype = (handler.headers.get("Content-Type") or "")
+        if "application/json" in ctype:
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+                pcm = base64.b64decode(payload.get("pcm_b64") or "")
+                t0 = float(payload.get("t0") or t0)
+            except Exception:
+                _send_json(handler, 400, json.dumps(
+                    {"error": "bad json body"}).encode("utf-8"))
+                return True
+        else:
+            pcm = raw
+        result = stt_only(pcm, t0)
+        _send_json(handler, 200, json.dumps(
+            result, ensure_ascii=False).encode("utf-8"))
+        return True
+    if parsed.path == "/dub/translate" and handler.command == "POST":
+        # v3.4: last-resort server translate for the phone (the
+        # phone's direct gtx call is the real path; this chain is
+        # usually 429 from Render's shared egress IP).
+        try:
+            length = int(handler.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 64 * 1024:
+            _send_json(handler, 400, json.dumps(
+                {"error": "empty or too large body"}).encode("utf-8"))
+            return True
+        try:
+            payload = json.loads(
+                handler.rfile.read(length).decode("utf-8"))
+        except Exception:
+            _send_json(handler, 400, json.dumps(
+                {"error": "bad json body"}).encode("utf-8"))
+            return True
+        result = translate_only(
+            payload.get("text") or "",
+            payload.get("src") or "en",
+            payload.get("dst") or "fa")
+        _send_json(handler, 200, json.dumps(
+            result, ensure_ascii=False).encode("utf-8"))
         return True
     if parsed.path == "/dub/segment" and handler.command == "POST":
         try:

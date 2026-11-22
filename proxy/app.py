@@ -187,7 +187,7 @@ TRANSLATE_INJECT = (
     '?cb=xfGoogleTranslateInit"></script>'
 )
 
-PROXY_VERSION = "3.3"
+PROXY_VERSION = "3.4"
 PROXY_BASE = "https://xfree-fa-proxy.onrender.com"
 
 # v3.2: every spelling of the two OAuth callback URLs that can
