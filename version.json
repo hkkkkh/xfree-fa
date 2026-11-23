@@ -1,1 +1,1 @@
-{"apkUrl":"https://github.com/hkkkkh/xfree-fa/releases/download/v3.11/xfree-fa-3.11.apk","notes":"نسخه ۳٫۱۱: سایت از ریشه درست شد — اول سرور بیدار می‌شه بعد سایت میاد، با دکمه تلاش دوباره؛ ویدیو و زیرنویس با لاگ کامل و راه جایگزین HTTP","versionCode":32,"versionName":"3.11"}
+{"apkUrl":"https://github.com/hkkkkh/xfree-fa/releases/download/v3.13/xfree-fa-3.13.apk","notes":"نسخه ۳٫۱۳: رفع ریشه‌ای پخش نشدن ویدیو — پروکسی حالا به درخواست‌های OPTIONS (CORS preflight) جواب می‌ده؛ آیکون اصلی بدون پس‌زمینه مشکی","versionCode":34,"versionName":"3.13"}

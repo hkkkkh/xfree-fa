@@ -173,7 +173,7 @@ RELAY_HOSTS = {
 # old references fail loudly instead of silently reappearing.
 TRANSLATE_INJECT = ""
 
-PROXY_VERSION = "3.12"
+PROXY_VERSION = "3.13"
 # v3.12: PROXY_BASE is now the FALLBACK public base only. The live
 # base is derived per request from the Host header (_own_base), so
 # the same code serves correct self-URLs on Render AND Railway
@@ -651,6 +651,33 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         self.handle_all()
+
+    def do_OPTIONS(self):
+        # v3.13 ROOT FIX: the site's <video> element carries
+        # crossOrigin="anonymous", so its Range fetch is a CORS
+        # fetch. Range was NOT a CORS-safelisted header before
+        # Chrome 111, so an older System WebView sends a CORS
+        # PREFLIGHT (OPTIONS) before the video GET. BaseHTTPRequest
+        # Handler has no do_OPTIONS, so the proxy answered 501
+        # with no CORS headers (proved live 2026-11-24) — the
+        # preflight failed, the media element errored, and the
+        # video NEVER played in the app, while up-to-date Chrome
+        # (no preflight: Range is safelisted since M111) played
+        # the same URL through the same proxy. Thumbnails are
+        # plain <img> (no crossorigin, no Range) so they never
+        # preflight — which is why only video broke. Answer every
+        # preflight with the CORS grant the media fetch needs.
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods",
+                         "GET, HEAD, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Range, If-Range, Content-Type, "
+                         "Authorization, X-Request-Id")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Content-Length", "0")
+        self.send_header("X-Proxy-Version", PROXY_VERSION)
+        self.end_headers()
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
