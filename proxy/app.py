@@ -51,12 +51,13 @@ v3.1 (2026-11-22):
     for anonymous users, not proxy gaps (verified live).
 
 
-Runs on Render free tier (or anywhere with Python 3, zero dependencies —
-only the standard library, so there is nothing to pip-install).
+Runs on Render free tier or Railway trial (or anywhere with
+Python 3, zero dependencies — only the standard library, so
+there is nothing to pip-install).
 
 Why this exists: xfree.com / thumbs.xfree.com / cdn.xfree.com are filtered
 in Iran, so the phone cannot reach them directly with VPN off. The phone
-talks ONLY to this service (onrender.com) and this service — running
+talks ONLY to this service and this service — running
 outside Iran — fetches the bytes and streams them back.
 
 v3.0 SPEED (measured 2026-11-22, warm proxy):
@@ -172,7 +173,12 @@ RELAY_HOSTS = {
 # old references fail loudly instead of silently reappearing.
 TRANSLATE_INJECT = ""
 
-PROXY_VERSION = "3.11"
+PROXY_VERSION = "3.12"
+# v3.12: PROXY_BASE is now the FALLBACK public base only. The live
+# base is derived per request from the Host header (_own_base), so
+# the same code serves correct self-URLs on Render AND Railway
+# without any hardcoded host. PROXY_BASE is used only when the
+# Host header is missing or unusable.
 PROXY_BASE = "https://xfree-fa-proxy.onrender.com"
 
 # v3.2: every spelling of the two OAuth callback URLs that can
@@ -996,6 +1002,21 @@ class Handler(BaseHTTPRequestHandler):
                     return "/g/" + host + loc[len(prefix):]
         return loc
 
+    def _own_base(self):
+        """This proxy's own public base URL, derived from the Host
+        header of the request being served — so the same code
+        serves correct self-URLs on Render, Railway, or a local
+        dev instance without a hardcoded host. Falls back to
+        PROXY_BASE when the Host header is missing or unusable
+        (validated: plain hostname characters + a dot, so a
+        hostile Host header can never inject a scheme, path, or
+        query into rewritten pages)."""
+        host = (self.headers.get("Host") or "").strip().split(":")[0]
+        if host and re.fullmatch(r"[A-Za-z0-9.-]+", host) \
+                and "." in host:
+            return "https://" + host
+        return PROXY_BASE
+
     def _rewrite_body(self, body, ctype):
         """Rewrite absolute site URLs in text bodies so subresources
         stay on the proxy origin instead of the filtered hosts.
@@ -1012,7 +1033,12 @@ class Handler(BaseHTTPRequestHandler):
             text = body.decode("utf-8")
         except Exception:
             return body
-        base = PROXY_BASE
+        # v3.12: base is derived per request from the Host header
+        # (_own_base) — the old code hardcoded the Render host
+        # here, so pages served from Railway still pointed video/
+        # thumbs/static URLs at the suspended Render service.
+        base = self._own_base()
+        host = base[8:]  # hostname without "https://"
         esc = "https:\\u002F\\u002F"
         # v3.2: protect the OAuth callback URLs BEFORE any rewrite
         # runs (see _OAUTH_CALLBACK_PROTECT): googleURL/appleURL
@@ -1031,10 +1057,9 @@ class Handler(BaseHTTPRequestHandler):
         for _h in sorted(RELAY_HOSTS):
             text = text.replace("https://" + _h, base + "/g/" + _h)
             text = text.replace("//" + _h,
-                                "//xfree-fa-proxy.onrender.com/g/" + _h)
+                                "//" + host + "/g/" + _h)
             text = text.replace(esc + _h,
-                                esc + "xfree-fa-proxy.onrender.com"
-                                "\\u002Fg\\u002F" + _h)
+                                esc + host + "\\u002Fg\\u002F" + _h)
         # v3.0: the Nuxt config sends the browser straight to
         # scraper.xfree.com and upload.xfree.com/media-api — both
         # filtered in Iran, so upload/scraper would silently fail.
@@ -1046,14 +1071,14 @@ class Handler(BaseHTTPRequestHandler):
         text = text.replace("//scraper.xfree.com", "//" + base[8:] + "/x-scraper")
         text = text.replace("//upload.xfree.com", "//" + base[8:] + "/x-upload")
         text = text.replace(esc + "scraper.xfree.com",
-                            esc + "xfree-fa-proxy.onrender.com\\u002Fx-scraper")
+                            esc + host + "\\u002Fx-scraper")
         text = text.replace(esc + "upload.xfree.com",
-                            esc + "xfree-fa-proxy.onrender.com\\u002Fx-upload")
-        text = text.replace(esc + "www.xfree.com", esc + "xfree-fa-proxy.onrender.com")
-        text = text.replace(esc + "xfree.com", esc + "xfree-fa-proxy.onrender.com")
-        text = text.replace(esc + "thumbs.xfree.com", esc + "xfree-fa-proxy.onrender.com\\u002Fimg?u=https:\\u002F\\u002Fthumbs.xfree.com")
-        text = text.replace(esc + "cdn.xfree.com", esc + "xfree-fa-proxy.onrender.com\\u002Fvideo?u=https:\\u002F\\u002Fcdn.xfree.com")
-        text = text.replace(esc + "static.xfree.com", esc + "xfree-fa-proxy.onrender.com\\u002Fstatic?u=https:\\u002F\\u002Fstatic.xfree.com")
+                            esc + host + "\\u002Fx-upload")
+        text = text.replace(esc + "www.xfree.com", esc + host)
+        text = text.replace(esc + "xfree.com", esc + host)
+        text = text.replace(esc + "thumbs.xfree.com", esc + host + "\\u002Fimg?u=https:\\u002F\\u002Fthumbs.xfree.com")
+        text = text.replace(esc + "cdn.xfree.com", esc + host + "\\u002Fvideo?u=https:\\u002F\\u002Fcdn.xfree.com")
+        text = text.replace(esc + "static.xfree.com", esc + host + "\\u002Fstatic?u=https:\\u002F\\u002Fstatic.xfree.com")
         # thumbs/cdn absolute URLs -> proxy /img / /video relays
         def _thumb(m):
             u = m.group(0)
@@ -1081,8 +1106,8 @@ class Handler(BaseHTTPRequestHandler):
         text = re.sub(r"https://static\.xfree\.com/[^\s\"'<>]+", _static, text)
         text = text.replace("https://www.xfree.com", base)
         text = text.replace("https://xfree.com", base)
-        text = text.replace("//www.xfree.com", "//xfree-fa-proxy.onrender.com")
-        text = text.replace("//xfree.com", "//xfree-fa-proxy.onrender.com")
+        text = text.replace("//www.xfree.com", "//" + host)
+        text = text.replace("//xfree.com", "//" + host)
         # v3.2: restore the OAuth callback URLs untouched — they
         # must reach the browser as https://www.xfree.com/...
         for _orig, _ph in _OAUTH_CALLBACK_PROTECT:
@@ -1142,12 +1167,18 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api"):
             headers["apiversion"] = "1.0"
             headers["language"] = "en"
+        # v3.12: the browser's Origin/Referer carry THIS proxy's
+        # host (Render or Railway) — accept the live per-request
+        # base as well as the PROXY_BASE fallback.
+        _own = self._own_base()
         origin = self.headers.get("Origin") or ""
-        if origin.startswith(PROXY_BASE):
+        if origin.startswith(_own) or origin.startswith(PROXY_BASE):
             origin = "https://www.xfree.com"
         headers["Origin"] = origin or "https://www.xfree.com"
         referer = self.headers.get("Referer") or ""
-        if referer.startswith(PROXY_BASE):
+        if referer.startswith(_own):
+            referer = "https://www.xfree.com/" + referer[len(_own + "/"):]
+        elif referer.startswith(PROXY_BASE):
             referer = "https://www.xfree.com/" + referer[len(PROXY_BASE + "/"):]
         headers["Referer"] = referer or "https://www.xfree.com/"
         if content_type:

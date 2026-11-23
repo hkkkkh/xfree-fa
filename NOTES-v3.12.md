@@ -1,4 +1,4 @@
-# v3.12 — host migration OFF Render (IN PROGRESS — blocked on account creation)
+# v3.12 — host migration OFF Render (DEPLOYED on Railway 2026-11-24)
 
 ## Why
 Render Hobby workspace exceeded its 5 GB/month free outbound bandwidth quota
@@ -48,6 +48,38 @@ Bandwidth is the deciding factor; no-card signup is a hard requirement
   restricted outbound network). The user's GitHub account hkkkkh should
   verify; if the trial comes back "limited", the proxy cannot reach
   xfree.com/Gemini and Railway is a dead end.
+
+## STATUS: DEPLOYED LIVE on Railway (2026-11-24 02:24) — host bug found + fixed
+- Project enthusiastic-integrity, service xfree-fa-proxy,
+  https://xfree-fa-proxy-production.up.railway.app — first deploy failed
+  (Custom Start Command was "python app.py", file is at proxy/app.py);
+  fixed to "python proxy/app.py" + Healthcheck Path "/health", redeploy
+  ACTIVE. Verified live from VM 02:26: /health 200, homepage 200, dub 2.0,
+  gemini-status configured false (no key yet — expected).
+- **BUG found 2026-11-24 ~02:30: proxy/app.py hardcoded
+  "xfree-fa-proxy.onrender.com"** in the HTML rewrite rules
+  (_rewrite_body) and PROXY_BASE — pages served from Railway still
+  pointed video/thumbs/static URLs at the SUSPENDED Render host.
+  FIXED (proxy 3.12): new `_own_base()` derives the proxy's own public
+  base per request from the Host header (validated hostname, fallback
+  PROXY_BASE); all rewrites + Origin/Referer handling use it. Same
+  code now serves correct self-URLs on Render AND Railway. Verified
+  locally with an in-process rewrite test (Railway host → all URLs
+  railway, 0 onrender refs, OAuth callback untouched; Render host →
+  old behavior; no/malicious Host → fallback).
+- **Real video file URL found 2026-11-24 ~02:35** (from the site's JS
+  bundle getCDNurl): player builds
+  `cdnUrl + name[0]/name[1]/name[2]/name/<file>` where
+  cdnUrl = `https://cdn.xfree.com/xfree-prod/`. The MAIN video file is
+  **full.mp4** (NOT converted.mp4 — that one 404s). Verified live:
+  Range 0-1023 → 206, total 176,839,219 bytes. Example (post 504230,
+  "Babe Sucks Me Off When I Play GTA V", 337 s):
+  `https://cdn.xfree.com/xfree-prod/c/8/b/c8b4b2af-f693-41c6-b877-cb1c7faa948c/full.mp4`
+  — user to open in phone Chrome WITHOUT VPN for the CDN reachability
+  test. Also verified: full-d.mp4 206 (209,196,866 B), listing7.mp4 206
+  (1,152,323 B), original.mp3 404 (no separate audio track — audio is
+  inside the mp4). SubtitleEngine can fetch only the audio-track
+  ranges from the direct CDN URL (~3% of bytes), no server ffmpeg needed.
 
 ## STATUS: blocked on account creation (needs the user's browser)
 No host can be deployed without an account, and account signup needs the
