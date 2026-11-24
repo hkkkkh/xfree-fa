@@ -67,8 +67,11 @@ v3.0 SPEED (measured 2026-11-22, warm proxy):
            connection per request) and upstream sent pages uncompressed.
   AFTER:   keep-alive connection pool (up to 6 reused TLS connections per
            upstream host), upstream gzip (568 KB page -> ~130 KB on the
-           wire), in-memory cache for anonymous HTML pages (120s) and
-           /_nuxt/ assets (3600s), Jina removed from the hot path
+           wire), in-memory cache for anonymous HTML pages (300s, v3.16:
+           was 120s — shorter than the warmup interval, so the homepage
+           expired mid-cycle) and
+           /_nuxt/ assets (86400s, v3.16: was 3600s; hashed names are
+           immutable), Jina removed from the hot path
            (it was unreachable from Render and wasted time on every
            API JSON body >= 1000 bytes — looks_like_page() is False for
            JSON, so the old code fired a doomed Jina fetch on API calls).
@@ -173,7 +176,7 @@ RELAY_HOSTS = {
 # old references fail loudly instead of silently reappearing.
 TRANSLATE_INJECT = ""
 
-PROXY_VERSION = "3.15"
+PROXY_VERSION = "3.16"
 # v3.12: PROXY_BASE is now the FALLBACK public base only. The live
 # base is derived per request from the Host header (_own_base), so
 # the same code serves correct self-URLs on Render AND Railway
@@ -435,7 +438,7 @@ def release_stream(token, broken=False):
 _RP_CACHE = {}  # key -> (status, headers, body, at)
 _RP_CACHE_LOCK = threading.Lock()
 _RP_CACHE_RULES = [  # (path prefix / exact, ttl seconds)
-    ("/_nuxt/", 3600),          # hashed filenames = immutable
+    ("/_nuxt/", 86400),         # hashed filenames = immutable (v3.16: was 3600)
     ("/api/post/", 300),        # video metadata, near-static
     ("/api/tag/", 300),
     ("/api/playlist/", 300),
@@ -1171,7 +1174,15 @@ class Handler(BaseHTTPRequestHandler):
                 cache_ttl = _cache_ttl(path)
                 if path in ("/", "/playlist") or path.startswith("/search") \
                         or path.startswith("/video"):
-                    cache_ttl = max(cache_ttl, 120)
+                    # v3.16: was 120s — the warmup loop ran every 300s, so
+                    # the homepage entry expired ~180s of every cycle and
+                    # the first real load after any idle stretch paid a
+                    # full upstream fetch (~1.8s). 300s TTL + 120s warmup
+                    # keeps it warm continuously. Safe: anonymous HTML
+                    # shell only; the feed itself comes from
+                    # /api/rs/homepage (30s TTL) client-side, and
+                    # Set-Cookie is stripped on cache put.
+                    cache_ttl = max(cache_ttl, 300)
             if cache_ttl > 0:
                 # v3.1: mobile and desktop SSR differ — never serve
                 # a cached desktop page to a phone (or vice versa).
@@ -1600,16 +1611,20 @@ def _warmup_loop(port):
     ~1.76 s and each _nuxt bundle in ~1.1-2.1 s (upstream fetch);
     warm, the same requests take ~0.72 s / ~0.4-0.8 s — 2-3x
     faster. But the cache only fills when a real client asks: the
-    homepage HTML is cached just 120 s (the 6-min keep-alive ping
-    cannot keep it warm) and the _nuxt bundles (3600 s TTL) are
+    homepage HTML is cached 300 s (v3.16, was 120 s — shorter than
+    the old 300 s warmup interval, so it expired mid-cycle) and the
+    _nuxt bundles (86400 s TTL) are
     never fetched by the ping at all — so the first user load after
     any idle stretch pays the upstream latency for every asset, on
     top of the ~3 s the phone itself needs to download ~2 MB of
     HTML+JS over a 5.3 Mbps line. This daemon thread re-fetches
     the homepage (mobile UA, so the "m" cache class is warmed)
     and every _nuxt script it references through the normal
-    handler path every 5 minutes, so the first real load is served
-    from proxy RAM. Ingress from xfree.com is free on Railway;
+    handler path every 2 minutes, so the first real load is served
+    from proxy RAM. v3.16: was every 5 minutes — but the homepage
+    TTL was only 120s, so the entry expired mid-cycle and the first
+    load after any idle stretch still paid a full upstream fetch.
+    Ingress from xfree.com is free on Railway;
     ~2 MB per cycle is negligible. Never blocks serving: all
     errors are swallowed and the loop always sleeps.
     """
@@ -1640,7 +1655,7 @@ def _warmup_loop(port):
                     pass
         except Exception:
             pass
-        time.sleep(300)
+        time.sleep(120)  # v3.16: was 300 — must stay under the 300s page TTL
 
 
 if __name__ == "__main__":
