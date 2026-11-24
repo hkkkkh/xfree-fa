@@ -173,7 +173,7 @@ RELAY_HOSTS = {
 # old references fail loudly instead of silently reappearing.
 TRANSLATE_INJECT = ""
 
-PROXY_VERSION = "3.13"
+PROXY_VERSION = "3.14"
 # v3.12: PROXY_BASE is now the FALLBACK public base only. The live
 # base is derived per request from the Host header (_own_base), so
 # the same code serves correct self-URLs on Render AND Railway
@@ -1593,8 +1593,60 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
 
+def _warmup_loop(port):
+    """v3.14 FIRST-LAUNCH FIX: keep the response cache warm.
+
+    Measured 2026-11-24: a cold proxy cache serves the homepage in
+    ~1.76 s and each _nuxt bundle in ~1.1-2.1 s (upstream fetch);
+    warm, the same requests take ~0.72 s / ~0.4-0.8 s — 2-3x
+    faster. But the cache only fills when a real client asks: the
+    homepage HTML is cached just 120 s (the 6-min keep-alive ping
+    cannot keep it warm) and the _nuxt bundles (3600 s TTL) are
+    never fetched by the ping at all — so the first user load after
+    any idle stretch pays the upstream latency for every asset, on
+    top of the ~3 s the phone itself needs to download ~2 MB of
+    HTML+JS over a 5.3 Mbps line. This daemon thread re-fetches
+    the homepage (mobile UA, so the "m" cache class is warmed)
+    and every _nuxt script it references through the normal
+    handler path every 5 minutes, so the first real load is served
+    from proxy RAM. Ingress from xfree.com is free on Railway;
+    ~2 MB per cycle is negligible. Never blocks serving: all
+    errors are swallowed and the loop always sleeps.
+    """
+    import urllib.request
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}))  # never use env proxies
+    ua = ("Mozilla/5.0 (Linux; Android 14; Redmi Note 13) "
+          "AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/131.0.0.0 Mobile Safari/537.36")
+    time.sleep(5)  # let the server start listening first
+    while True:
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/" % port,
+                headers={"User-Agent": ua})
+            with opener.open(req, timeout=15) as r:
+                html = r.read().decode("utf-8", "ignore")
+            scripts = sorted(set(re.findall(
+                r'/_nuxt/[A-Za-z0-9._-]+\.js', html)))
+            for path in scripts:
+                try:
+                    req = urllib.request.Request(
+                        "http://127.0.0.1:%d%s" % (port, path),
+                        headers={"User-Agent": ua})
+                    with opener.open(req, timeout=15) as r:
+                        r.read()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(300)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     server = Server(("0.0.0.0", port), Handler)
     print("xfree-fa proxy listening on port %d" % port, flush=True)
+    threading.Thread(target=_warmup_loop, args=(port,),
+                     daemon=True, name="xf-warmup").start()
     server.serve_forever()
