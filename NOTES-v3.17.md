@@ -2,10 +2,16 @@
 
 **Built:** 2026-11-24 ~05:30–06:00 UTC. **versionCode 38, versionName 3.17.**
 **APK:** `~/workspace/your_files/xfree-fa-3.17.apk` — 1,480,534 bytes,
-md5 `4992f21404185c66507f6ace59a271e3`. Same keystore/cert as all versions
+md5 `50b747e5aea9e20e4c738891d1a9f7d9`. Same keystore/cert as all versions
 (SHA-256 `f5ace241…dc4dc1`) — installs over v3.16. apksigner: **v2 + v3 true**.
 aapt2 badging: `com.xfree.fa` v38/3.17, label U+2800 blank, minSdk 24,
 targetSdk 34. Dex: **0 × `onrender`, 0 × `AIza`**; Railway host present.
+**Rebuild note:** the first build of this version shipped with the
+lookahead placeholder `LOOKAHEAD_S = 0.0` still in place (the live test
+had proved 3.0 s but the field was never flipped). Caught by a final
+line-number check; rebuilt with `LOOKAHEAD_S = 3.0` — same size, new
+md5 above. The GitHub push (commit `91dcade7`) carried the pre-fix
+notes; the corrected notes were pushed in a follow-up commit.
 **Proxy: 3.15 (pushed 2026-11-24 05:26, commit `591f2f9e`), no change in
 this build** — the app side of v3.17 only. Live re-verified after the
 build: `/health` 3.15, `/dub/gemini-status` configured:true,
