@@ -119,6 +119,14 @@ _STATS = {
 }
 _STATS_LOCK = threading.Lock()
 
+# v3.17 stage TIMING (Claude #6 + ChatGPT #4): each session's
+# start time (perf_counter) so every _dlog line carries the
+# elapsed ms since the session began — the measurement both
+# answers ask for (BUTTON_CLICK->WS_OPEN->SESSION_READY->
+# FIRST_AUDIO->FIRST_TEXT), without a separate timing channel.
+_SESSION_T0 = {}
+_SESSION_T0_LOCK = threading.Lock()
+
 
 def _stat(name, n=1):
     try:
@@ -136,9 +144,17 @@ def _dlog(session, stage, extra=""):
     WS_AUDIO_BYTES / GEMINI_CONNECTED / GEMINI_AUDIO_SENT /
     GEMINI_TRANSCRIPT_RECEIVED / WS_TRANSCRIPT_SENT /
     WS_DISCONNECTED. The session id comes from the phone (?sid=)
-    when present, else a generated one."""
+    when present, else a generated one.
+    v3.17: every line also carries +<ms>ms since the session
+    started (perf_counter), so the slow stage is visible in the
+    log alone."""
     try:
-        print("dub: [%s] %s %s" % (session, stage, extra),
+        el = ""
+        with _SESSION_T0_LOCK:
+            t0 = _SESSION_T0.get(session)
+        if t0 is not None:
+            el = " +%.0fms" % ((time.perf_counter() - t0) * 1000)
+        print("dub: [%s] %s%s %s" % (session, stage, el, extra),
               flush=True)
     except Exception:
         pass
@@ -146,16 +162,23 @@ def _dlog(session, stage, extra=""):
 
 def _new_session(handler):
     """Session id shared phone<->proxy: ?sid= from the phone when
-    present, else a fresh 12-hex id."""
+    present, else a fresh 12-hex id. v3.17: also records the
+    session start (perf_counter) for _dlog elapsed timing."""
     try:
         q = urllib.parse.parse_qs(
             urllib.parse.urlparse(handler.path).query)
         sid = (q.get("sid") or [""])[0].strip()
         if sid:
-            return sid[:32]
+            sid = sid[:32]
+            with _SESSION_T0_LOCK:
+                _SESSION_T0.setdefault(sid, time.perf_counter())
+            return sid
     except Exception:
         pass
-    return secrets.token_hex(6)
+    sid = secrets.token_hex(6)
+    with _SESSION_T0_LOCK:
+        _SESSION_T0.setdefault(sid, time.perf_counter())
+    return sid
 
 # v3.9 (2026-11-22) — subtitle root-cause fixes, proved live:
 #  (a) /dub/ws returned EMPTY STT for every window on live Render
@@ -1909,6 +1932,13 @@ def handle_dub_gemini_ws(handler):
             raise RuntimeError("gemini setup not completed")
         _stat("gemini_sessions")
         _dlog(session, "GEMINI_CONNECTED", "setup_complete")
+        # v3.17 PRE-WARM: tell the app the Gemini session is
+        # genuinely ready (setupComplete received) — the phone
+        # shows SESSION_READY only on this message, never on the
+        # bare socket open. A pre-warmed session sends no audio
+        # until the user taps, so the tap only needs to start
+        # the audio flow.
+        _send({"type": "ready"})
     except Exception:
         # Generic error only — never the exception text (it could
         # carry server response bytes) and never the key.
@@ -1974,6 +2004,25 @@ def handle_dub_gemini_ws(handler):
                 except Exception:
                     continue
                 _stat("gemini_messages")
+                # v3.17 GOAWAY (round-2 #2): Gemini Live sessions
+                # live ~10 min; before closing, the server sends
+                # {"goAway": {"timeLeft": "60s"}}. Forward it so
+                # the phone can re-warm instead of discovering a
+                # dead session at tap time. No transcript here —
+                # check before the _gemini_parse_out skip.
+                try:
+                    _gm = json.loads(text)
+                    if isinstance(_gm, dict) and "goAway" in _gm:
+                        _ga = _gm.get("goAway") or {}
+                        _tl = _ga.get("timeLeft", "?") \
+                            if isinstance(_ga, dict) else "?"
+                        _dlog(session, "GEMINI_GOAWAY",
+                              "timeLeft=%s" % _tl)
+                        _send({"type": "goaway",
+                               "timeLeft": str(_tl)})
+                        continue
+                except Exception:
+                    pass
                 fa, done, lang = _gemini_parse_out(text)
                 if not fa:
                     continue

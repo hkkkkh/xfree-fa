@@ -173,7 +173,7 @@ RELAY_HOSTS = {
 # old references fail loudly instead of silently reappearing.
 TRANSLATE_INJECT = ""
 
-PROXY_VERSION = "3.14"
+PROXY_VERSION = "3.15"
 # v3.12: PROXY_BASE is now the FALLBACK public base only. The live
 # base is derived per request from the Host header (_own_base), so
 # the same code serves correct self-URLs on Render AND Railway
