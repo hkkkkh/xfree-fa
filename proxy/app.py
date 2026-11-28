@@ -60,6 +60,20 @@ in Iran, so the phone cannot reach them directly with VPN off. The phone
 talks ONLY to this service and this service — running
 outside Iran — fetches the bytes and streams them back.
 
+v3.17 (2026-11-28) — SECOND SITE, NO APP INSTALL:
+  tik-porn.com joins the app through the proxy only, so the
+  already-installed v3.17 app gets it with no reinstall: /tik/
+  reverse-proxies tik-porn.com (Next.js RedGifs client — feed via
+  its own /api/proxy, /api/img, /api/candy-video routes) and /tikm/
+  reverse-proxies its video host media.tik-porn.com
+  (/api/video?url=<redgifs mp4>, Range 206 verified live; real
+  clips ~4 MB). A small fixed top-left pill is injected into the
+  HTML the proxy serves: «تیک‌پورن» -> /tik/ on xfree pages,
+  «ایکس‌فری» -> / on tik-porn pages. RedGifs poster/avatar images
+  go through the /g/ relay. Tik-porn's /api/proxy rate-limits
+  this VM's rotating datacenter IP (_ratelimited:true) — whether
+  Railway's egress IP is also limited is only provable live.
+
 v3.0 SPEED (measured 2026-11-22, warm proxy):
   BEFORE:  / 2.44s (568 KB uncompressed), /playlist 1.23s, /search 1.80s,
            /_nuxt/ bundle 0.8-1.15s EACH, thumb 0.68s. Every request did
@@ -165,6 +179,10 @@ RELAY_HOSTS = {
     "www.googletagmanager.com", "challenges.cloudflare.com",
     "appleid.cdn-apple.com", "appleid.apple.com", "idmsa.apple.com",
     "content.xfree.com", "mtm.ntl.cloud",
+    # v3.17: tik-porn.com poster/avatar images live on RedGifs
+    # hosts (media.redgifs.com, userpic.redgifs.com) — the page
+    # <img>s them directly, so they are relayed under /g/ too.
+    "media.redgifs.com", "userpic.redgifs.com",
 }
 
 # v3.6: Google Translate Element injection REMOVED (user correction
@@ -176,7 +194,7 @@ RELAY_HOSTS = {
 # old references fail loudly instead of silently reappearing.
 TRANSLATE_INJECT = ""
 
-PROXY_VERSION = "3.16"
+PROXY_VERSION = "3.17"
 # v3.12: PROXY_BASE is now the FALLBACK public base only. The live
 # base is derived per request from the Host header (_own_base), so
 # the same code serves correct self-URLs on Render AND Railway
@@ -485,6 +503,34 @@ def fetch_stream(url, headers, timeout=30):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+def _inject_switch_pill(body, site):
+    """v3.17: site-switch pill (NO app install needed — the pill is
+    injected by the proxy into the HTML the already-installed v3.17
+    app serves). site "xfree" -> pill «تیک‌پورن» linking to /tik/;
+    site "tik" -> pill «ایکس‌فری» linking to /. Small fixed pill,
+    top-left, very high z-index; plain <a> so it navigates like any
+    link and never intercepts the site's own taps elsewhere.
+    Inserted before </body> (or appended if the page has none)."""
+    if site == "tik":
+        label, href = "ایکس‌فری", "/"
+    else:
+        label, href = "تیک‌پورن", "/tik/"
+    pill = ('<a href="%s" style="position:fixed;top:6px;left:6px;'
+            'z-index:2147483647;background:rgba(15,15,15,.88);color:#fff;'
+            'font:600 12px/1.5 -apple-system,system-ui,sans-serif;'
+            'padding:5px 11px;border-radius:15px;text-decoration:none;'
+            'border:1px solid #7e1fe0;box-shadow:0 1px 6px rgba(0,0,0,.5)">'
+            '%s</a>' % (href, label))
+    try:
+        text = body.decode("utf-8")
+    except Exception:
+        return body
+    idx = text.lower().rfind("</body>")
+    if idx >= 0:
+        return (text[:idx] + pill + text[idx:]).encode("utf-8")
+    return (text + pill).encode("utf-8")
+
+
 def looks_like_page(body):
     """True if a fetched body is the real site page, not a Cloudflare
     challenge / block page. A challenge page must never be cached or
@@ -729,6 +775,13 @@ class Handler(BaseHTTPRequestHandler):
                                    parsed, raw,
                                    self.headers.get("Content-Type"))
             return
+        # v3.17: tik-porn write methods (same handler as GET).
+        if parsed.path == "/tik" or parsed.path.startswith("/tik/") \
+                or parsed.path == "/tikm" \
+                or parsed.path.startswith("/tikm/"):
+            self.handle_tik_proxy(parsed, raw,
+                                  self.headers.get("Content-Type"))
+            return
         # v2.6: any other POST (e.g. /api/login, /api/follow) goes
         # through the reverse proxy to the real site.
         self.handle_reverse_proxy(parsed, raw,
@@ -764,6 +817,12 @@ class Handler(BaseHTTPRequestHandler):
                                    parsed, raw,
                                    self.headers.get("Content-Type"))
             return
+        if parsed.path == "/tik" or parsed.path.startswith("/tik/") \
+                or parsed.path == "/tikm" \
+                or parsed.path.startswith("/tikm/"):
+            self.handle_tik_proxy(parsed, raw,
+                                  self.headers.get("Content-Type"))
+            return
         self.handle_reverse_proxy(parsed, raw,
                                   self.headers.get("Content-Type"))
 
@@ -791,6 +850,14 @@ class Handler(BaseHTTPRequestHandler):
             headers["Content-Type"] = content_type
         headers["Origin"] = "https://www.xfree.com"
         headers["Referer"] = "https://www.xfree.com/"
+        if host in ("media.redgifs.com", "userpic.redgifs.com"):
+            # v3.17: RedGifs hotlink protection 403s any request
+            # carrying a foreign Referer (proved live 2026-11-28:
+            # Referer https://tik-porn.com/ -> 403, no Referer ->
+            # 200). The relay's xfree Referer would 403 every
+            # poster/avatar, so send neither header for these hosts.
+            headers.pop("Origin", None)
+            headers.pop("Referer", None)
         try:
             status, resp_headers, body = pool_request(
                 host, self.command, target, headers,
@@ -1025,6 +1092,17 @@ class Handler(BaseHTTPRequestHandler):
                      "//www.xfree.com", "//xfree.com"):
             if loc.startswith(host):
                 return loc[len(host):] or "/"
+        # v3.17: tik-porn redirects stay on the proxy too.
+        for host, prefix in (("https://tik-porn.com", "/tik"),
+                             ("https://media.tik-porn.com", "/tikm"),
+                             ("http://tik-porn.com", "/tik"),
+                             ("http://media.tik-porn.com", "/tikm"),
+                             ("//tik-porn.com", "/tik"),
+                             ("//media.tik-porn.com", "/tikm")):
+            if loc.startswith(host):
+                rest = loc[len(host):] or "/"
+                return prefix + rest if rest.startswith("/") \
+                    else prefix + "/" + rest
         for scheme in ("https://", "http://", "//"):
             for host in RELAY_HOSTS:
                 prefix = scheme + host
@@ -1138,6 +1216,27 @@ class Handler(BaseHTTPRequestHandler):
         text = text.replace("https://xfree.com", base)
         text = text.replace("//www.xfree.com", "//" + host)
         text = text.replace("//xfree.com", "//" + host)
+        # v3.17: tik-porn.com as a second site. Media host FIRST
+        # (it contains "tik-porn.com" as a substring of its own
+        # suffix — the scheme forms can't collide, but order keeps
+        # the intent obvious). The video element builds its src as
+        # https://media.tik-porn.com/api/video?url=<redgifs mp4>
+        # (bundle 789) and the JSON-LD contentUrl uses the same
+        # host; both become proxy-relative /tikm/... so video bytes
+        # flow through this proxy like xfree's /video relay.
+        text = text.replace("https://media.tik-porn.com",
+                            base + "/tikm")
+        text = text.replace("https://tik-porn.com", base + "/tik")
+        text = text.replace("//media.tik-porn.com",
+                            "//" + host + "/tikm")
+        text = text.replace("//tik-porn.com", "//" + host + "/tik")
+        text = text.replace("https:\\/\\/media.tik-porn.com",
+                            base + "/tikm")
+        text = text.replace("https:\\/\\/tik-porn.com", base + "/tik")
+        text = text.replace(esc + "media.tik-porn.com",
+                            esc + host + "\\u002Ftikm")
+        text = text.replace(esc + "tik-porn.com",
+                            esc + host + "\\u002Ftik")
         # v3.2: restore the OAuth callback URLs untouched — they
         # must reach the browser as https://www.xfree.com/...
         for _orig, _ph in _OAUTH_CALLBACK_PROTECT:
@@ -1265,11 +1364,138 @@ class Handler(BaseHTTPRequestHandler):
         # 2026-11-22): it produced the Chrome translate bar/popup
         # the user rejected. Subtitles are the bottom-of-video
         # caption overlay only — never page translation.
+        # v3.17: site-switch pill on xfree HTML pages («تیک‌پورن» ->
+        # /tik/). Injected AFTER the Jina fallback too, so a Jina
+        # page would also carry it; cached pages store the pill.
+        if method == "GET" and status == 200 \
+                and ctype.startswith("text/html"):
+            body = _inject_switch_pill(body, "xfree")
         if cache_key is not None and status == 200:
             if ctype.startswith("text/html") and not looks_like_page(body):
                 pass  # never cache a challenge page
             else:
                 _cache_put(cache_key, status, resp_headers, body, cache_ttl)
+        self._send_proxied(status, resp_headers, body)
+
+    def handle_tik_proxy(self, parsed, raw=b"", content_type=None):
+        """v3.17: tik-porn.com as a SECOND site in the same app
+        (NO app install — the already-installed v3.17 app reaches
+        it through the switch pill).
+        /tik/<path>  -> https://tik-porn.com/<path> (pages,
+        _next chunks, same-origin /api/* routes: /api/proxy,
+        /api/img, /api/candy-video — the RedGifs feed data flows
+        through the site's own backend, so no RedGifs key is
+        needed here).
+        /tikm/<path> -> https://media.tik-porn.com/<path> (the
+        video host: /api/video?url=<redgifs mp4>, Range 206).
+        Verified 2026-11-28: the site is a Next.js RedGifs client;
+        real clips are ~4 MB (media.redgifs.com/<Name>-mobile.mp4);
+        media /api/video?url= answers Range 206 (TTFB ~1.1 s);
+        /video?url= (no /api) is a 404 Next page on the media host
+        — the <video> element uses the /api form (bundle 789).
+        Tik-porn's /api/proxy rate-limits THIS VM's rotating
+        datacenter IP (_ratelimited:true); whether Railway's egress
+        IP is also limited is only provable live. RedGifs poster /
+        avatar images (media.redgifs.com, userpic.redgifs.com) go
+        through the /g/ relay (RELAY_HOSTS). HTML responses get
+        the switch pill («ایکس‌فری» -> /)."""
+        path = parsed.path
+        if path == "/tikm" or path.startswith("/tikm/"):
+            host = "media.tik-porn.com"
+            rest = path[5:] or "/"
+        elif path == "/tik" or path.startswith("/tik/"):
+            host = "tik-porn.com"
+            rest = path[4:] or "/"
+        else:
+            self.send_text(404, "unknown tik path")
+            return
+        if not rest.startswith("/"):
+            rest = "/" + rest
+        target = rest
+        if parsed.query:
+            target += "?" + parsed.query
+        method = self.command
+        # Range (video) always streams — never buffered in memory.
+        if self.headers.get("Range"):
+            headers = {"User-Agent": self.client_ua()}
+            for name in ("Accept", "Accept-Language", "If-Range"):
+                value = self.headers.get(name)
+                if value:
+                    headers[name] = value
+            headers["Range"] = self.headers.get("Range")
+            headers["Referer"] = "https://tik-porn.com/"
+            try:
+                _st, _hdrs, resp, token = pool_stream(
+                    host, "GET", target, headers, timeout=30)
+            except Exception as exc:
+                self.send_text(502, "upstream failed: %s" % exc)
+                return
+            self.stream_response_pooled(resp, token)
+            return
+        headers = {"User-Agent": self.client_ua()}
+        for name in ("Accept", "Accept-Language"):
+            value = self.headers.get(name)
+            if value:
+                headers[name] = value
+        cookies = self.headers.get("Cookie")
+        if cookies:
+            headers["Cookie"] = cookies
+        _own = self._own_base()
+        referer = self.headers.get("Referer") or ""
+        if referer.startswith(_own + "/tikm/"):
+            referer = ("https://media.tik-porn.com/"
+                       + referer[len(_own + "/tikm/"):])
+        elif referer.startswith(_own + "/tik/"):
+            referer = ("https://tik-porn.com/"
+                       + referer[len(_own + "/tik/"):])
+        elif referer.startswith(_own):
+            referer = "https://tik-porn.com/"
+        headers["Referer"] = referer or "https://tik-porn.com/"
+        origin = self.headers.get("Origin") or ""
+        if origin.startswith(_own):
+            origin = "https://tik-porn.com"
+        headers["Origin"] = origin or "https://tik-porn.com"
+        if content_type:
+            headers["Content-Type"] = content_type
+        # Cache: _next chunks (hashed, immutable) 86400s; the /tik/
+        # shell 300s; everything else uncached (feed/API is dynamic).
+        cache_key = None
+        cache_ttl = 0
+        if method == "GET" and not cookies:
+            _ua = self.client_ua()
+            _cls = "m" if ("Mobile" in _ua or "Android" in _ua) else "d"
+            if rest.startswith("/_next/static/"):
+                cache_ttl = 86400
+            elif rest == "/":
+                # v3.17: 300s, not 120s — the warmup runs every 120s,
+                # so a 120s TTL expires right at the next warmup
+                # (same mid-cycle expiry bug v3.16 fixed for xfree).
+                cache_ttl = 300
+            if cache_ttl > 0:
+                cache_key = (method, path, _cls)
+                hit = _cache_get(cache_key)
+                if hit is not None:
+                    _status, _hdrs, _body, _at, _ttl = hit
+                    self._send_proxied(_status, _hdrs, _body,
+                                       cache_hit=True)
+                    return
+        try:
+            status, resp_headers, body = pool_request(
+                host, method, target, headers,
+                body=raw or None, timeout=30)
+        except Exception as exc:
+            self.send_text(502, "upstream failed: %s" % exc)
+            return
+        ctype = _header_get(resp_headers, "Content-Type") or ""
+        body = self._rewrite_body(body, ctype)
+        if method == "GET" and status == 200 \
+                and ctype.startswith("text/html"):
+            if not looks_like_page(body):
+                self.send_text(502, "upstream blocked (challenge page)")
+                return
+            body = _inject_switch_pill(body, "tik")
+        if cache_key is not None and status == 200:
+            _cache_put(cache_key, status, resp_headers, body, cache_ttl)
         self._send_proxied(status, resp_headers, body)
 
     def _send_proxied(self, status, resp_headers, body, cache_hit=False):
@@ -1361,6 +1587,14 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/x-upload/"):
             self.handle_host_relay("upload.xfree.com", "/x-upload",
                                    parsed, b"", None)
+            return
+
+        # v3.17: tik-porn.com as a second site (/tik/ -> the site,
+        # /tikm/ -> its video host media.tik-porn.com).
+        if parsed.path == "/tik" or parsed.path.startswith("/tik/") \
+                or parsed.path == "/tikm" \
+                or parsed.path.startswith("/tikm/"):
+            self.handle_tik_proxy(parsed)
             return
 
         # v2.6: everything else is the real site, served from this
@@ -1648,6 +1882,27 @@ def _warmup_loop(port):
                 try:
                     req = urllib.request.Request(
                         "http://127.0.0.1:%d%s" % (port, path),
+                        headers={"User-Agent": ua})
+                    with opener.open(req, timeout=15) as r:
+                        r.read()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # v3.17: also warm the tik-porn homepage + its _next chunks
+        # (same reason: the first real load should hit proxy RAM).
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/tik/" % port,
+                headers={"User-Agent": ua})
+            with opener.open(req, timeout=15) as r:
+                tik_html = r.read().decode("utf-8", "ignore")
+            for path in sorted(set(re.findall(
+                    r'/_next/static/chunks/[A-Za-z0-9._-]+\.js',
+                    tik_html))):
+                try:
+                    req = urllib.request.Request(
+                        "http://127.0.0.1:%d/tik%s" % (port, path),
                         headers={"User-Agent": ua})
                     with opener.open(req, timeout=15) as r:
                         r.read()
