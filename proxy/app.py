@@ -60,6 +60,18 @@ in Iran, so the phone cannot reach them directly with VPN off. The phone
 talks ONLY to this service and this service — running
 outside Iran — fetches the bytes and streams them back.
 
+v3.18 (2026-11-28) — THIRD SITE, NO APP INSTALL:
+  redgifs.com joins through the proxy only: /red/ reverse-proxies
+  www.redgifs.com (React SPA) and /redapi/ reverse-proxies
+  api.redgifs.com (the v2 API incl. the IP-bound
+  v2/auth/temporary token flow and /v2/gifs/<id>/<q>.m3u8 HLS).
+  Routing token request + API calls through this one proxy keeps
+  them on a single egress IP (the token is IP-bound — WrongSender
+  otherwise). Media files go through the /g/ relay. The switch
+  pill now shows TWO pills (the other two sites) on every page.
+  .m3u8 playlists are rewritten (mpegurl added to the rewriteable
+  content types) so HLS segment URLs stay on the proxy.
+
 v3.17 (2026-11-28) — SECOND SITE, NO APP INSTALL:
   tik-porn.com joins the app through the proxy only, so the
   already-installed v3.17 app gets it with no reinstall: /tik/
@@ -194,7 +206,7 @@ RELAY_HOSTS = {
 # old references fail loudly instead of silently reappearing.
 TRANSLATE_INJECT = ""
 
-PROXY_VERSION = "3.17"
+PROXY_VERSION = "3.18"
 # v3.12: PROXY_BASE is now the FALLBACK public base only. The live
 # base is derived per request from the Host header (_own_base), so
 # the same code serves correct self-URLs on Render AND Railway
@@ -506,29 +518,35 @@ def fetch_stream(url, headers, timeout=30):
 def _inject_switch_pill(body, site):
     """v3.17: site-switch pill (NO app install needed — the pill is
     injected by the proxy into the HTML the already-installed v3.17
-    app serves). site "xfree" -> pill «تیک‌پورن» linking to /tik/;
-    site "tik" -> pill «ایکس‌فری» linking to /. Small fixed pill,
-    top-left, very high z-index; plain <a> so it navigates like any
-    link and never intercepts the site's own taps elsewhere.
-    Inserted before </body> (or appended if the page has none)."""
-    if site == "tik":
-        label, href = "ایکس‌فری", "/"
-    else:
-        label, href = "تیک‌پورن", "/tik/"
-    pill = ('<a href="%s" style="position:fixed;top:6px;left:6px;'
-            'z-index:2147483647;background:rgba(15,15,15,.88);color:#fff;'
-            'font:600 12px/1.5 -apple-system,system-ui,sans-serif;'
-            'padding:5px 11px;border-radius:15px;text-decoration:none;'
-            'border:1px solid #7e1fe0;box-shadow:0 1px 6px rgba(0,0,0,.5)">'
-            '%s</a>' % (href, label))
+    app serves). v3.18: THREE sites now, so each page carries TWO
+    small pills linking to the OTHER two sites (stacked top-left).
+    site "xfree" -> «تیک‌پورن» (/tik/) + «ردگیفز» (/red/);
+    site "tik" -> «ایکس‌فری» (/) + «ردگیفز» (/red/);
+    site "red" -> «ایکس‌فری» (/) + «تیک‌پورن» (/tik/).
+    Small fixed pills, top-left, very high z-index; plain <a> so
+    they navigate like any link and never intercept the site's own
+    taps elsewhere. Inserted before </body> (or appended if the
+    page has none)."""
+    others = {"xfree": (("تیک‌پورن", "/tik/"), ("ردگیفز", "/red/")),
+              "tik": (("ایکس‌فری", "/"), ("ردگیفز", "/red/")),
+              "red": (("ایکس‌فری", "/"), ("تیک‌پورن", "/tik/"))}
+    links = others.get(site, others["xfree"])
+    style = ('position:fixed;left:6px;z-index:2147483647;'
+             'background:rgba(15,15,15,.88);color:#fff;'
+             'font:600 12px/1.5 -apple-system,system-ui,sans-serif;'
+             'padding:5px 11px;border-radius:15px;text-decoration:none;'
+             'border:1px solid #7e1fe0;box-shadow:0 1px 6px rgba(0,0,0,.5)')
+    pills = "".join(
+        '<a href="%s" style="%stop:%dpx">%s</a>' % (href, style, top, label)
+        for (label, href), top in zip(links, (6, 38)))
     try:
         text = body.decode("utf-8")
     except Exception:
         return body
     idx = text.lower().rfind("</body>")
     if idx >= 0:
-        return (text[:idx] + pill + text[idx:]).encode("utf-8")
-    return (text + pill).encode("utf-8")
+        return (text[:idx] + pills + text[idx:]).encode("utf-8")
+    return (text + pills).encode("utf-8")
 
 
 def looks_like_page(body):
@@ -782,6 +800,13 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_tik_proxy(parsed, raw,
                                   self.headers.get("Content-Type"))
             return
+        # v3.18: redgifs write methods (same handler as GET).
+        if parsed.path == "/red" or parsed.path.startswith("/red/") \
+                or parsed.path == "/redapi" \
+                or parsed.path.startswith("/redapi/"):
+            self.handle_red_proxy(parsed, raw,
+                                  self.headers.get("Content-Type"))
+            return
         # v2.6: any other POST (e.g. /api/login, /api/follow) goes
         # through the reverse proxy to the real site.
         self.handle_reverse_proxy(parsed, raw,
@@ -821,6 +846,12 @@ class Handler(BaseHTTPRequestHandler):
                 or parsed.path == "/tikm" \
                 or parsed.path.startswith("/tikm/"):
             self.handle_tik_proxy(parsed, raw,
+                                  self.headers.get("Content-Type"))
+            return
+        if parsed.path == "/red" or parsed.path.startswith("/red/") \
+                or parsed.path == "/redapi" \
+                or parsed.path.startswith("/redapi/"):
+            self.handle_red_proxy(parsed, raw,
                                   self.headers.get("Content-Type"))
             return
         self.handle_reverse_proxy(parsed, raw,
@@ -1098,7 +1129,14 @@ class Handler(BaseHTTPRequestHandler):
                              ("http://tik-porn.com", "/tik"),
                              ("http://media.tik-porn.com", "/tikm"),
                              ("//tik-porn.com", "/tik"),
-                             ("//media.tik-porn.com", "/tikm")):
+                             ("//media.tik-porn.com", "/tikm"),
+                             # v3.18: redgifs redirects too.
+                             ("https://www.redgifs.com", "/red"),
+                             ("https://api.redgifs.com", "/redapi"),
+                             ("http://www.redgifs.com", "/red"),
+                             ("http://api.redgifs.com", "/redapi"),
+                             ("//www.redgifs.com", "/red"),
+                             ("//api.redgifs.com", "/redapi")):
             if loc.startswith(host):
                 rest = loc[len(host):] or "/"
                 return prefix + rest if rest.startswith("/") \
@@ -1135,7 +1173,7 @@ class Handler(BaseHTTPRequestHandler):
             return body
         low = ctype.lower()
         if not (low.startswith("text/") or "javascript" in low
-                or "json" in low or "xml" in low):
+                or "json" in low or "xml" in low or "mpegurl" in low):
             return body
         try:
             text = body.decode("utf-8")
@@ -1237,6 +1275,27 @@ class Handler(BaseHTTPRequestHandler):
                             esc + host + "\\u002Ftikm")
         text = text.replace(esc + "tik-porn.com",
                             esc + host + "\\u002Ftik")
+        # v3.18: redgifs.com as a third site. The React app calls
+        # https://api.redgifs.com/ (axios baseURL, incl. the
+        # IP-bound v2/auth/temporary token flow and the
+        # /v2/gifs/<id>/<q>.m3u8 HLS playlists) — all rewritten to
+        # /redapi/ so token request + API calls share this proxy's
+        # single egress IP. media/userpic redgifs hosts are already
+        # in RELAY_HOSTS (rewritten to /g/ above).
+        text = text.replace("https://api.redgifs.com",
+                            base + "/redapi")
+        text = text.replace("https://www.redgifs.com", base + "/red")
+        text = text.replace("//api.redgifs.com",
+                            "//" + host + "/redapi")
+        text = text.replace("//www.redgifs.com", "//" + host + "/red")
+        text = text.replace("https:\\/\\/api.redgifs.com",
+                            base + "/redapi")
+        text = text.replace("https:\\/\\/www.redgifs.com",
+                            base + "/red")
+        text = text.replace(esc + "api.redgifs.com",
+                            esc + host + "\\u002Fredapi")
+        text = text.replace(esc + "www.redgifs.com",
+                            esc + host + "\\u002Fred")
         # v3.2: restore the OAuth callback URLs untouched — they
         # must reach the browser as https://www.xfree.com/...
         for _orig, _ph in _OAUTH_CALLBACK_PROTECT:
@@ -1498,6 +1557,121 @@ class Handler(BaseHTTPRequestHandler):
             _cache_put(cache_key, status, resp_headers, body, cache_ttl)
         self._send_proxied(status, resp_headers, body)
 
+    def handle_red_proxy(self, parsed, raw=b"", content_type=None):
+        """v3.18: redgifs.com as a THIRD site in the same app.
+        /red/<path>    -> https://www.redgifs.com/<path> (React
+        SPA shell + /static chunks).
+        /redapi/<path> -> https://api.redgifs.com/<path> (the API
+        the SPA calls: v2/auth/temporary token flow, feeds,
+        /v2/gifs/<id>/<q>.m3u8 HLS playlists + segments).
+        The token is IP-bound (WrongSender if the token request and
+        the API call come from different IPs — proved from this VM,
+        whose egress IPv6 rotates); routing both through this proxy
+        keeps them on ONE egress IP. Media files
+        (media.redgifs.com mp4/poster, userpic.redgifs.com avatar)
+        go through the /g/ relay (RELAY_HOSTS, no-Referer fix).
+        HTML responses get the two switch pills (xfree + tik-porn).
+        Verified 2026-11-28: React SPA, 11 KB shell, API base
+        https://api.redgifs.com/ (axios), m3u8 builder
+        /v2/gifs/<id>/<q>.m3u8 in bundle common-*."""
+        path = parsed.path
+        if path == "/redapi" or path.startswith("/redapi/"):
+            host = "api.redgifs.com"
+            rest = path[7:] or "/"
+        elif path == "/red" or path.startswith("/red/"):
+            host = "www.redgifs.com"
+            rest = path[4:] or "/"
+        else:
+            self.send_text(404, "unknown red path")
+            return
+        if not rest.startswith("/"):
+            rest = "/" + rest
+        target = rest
+        if parsed.query:
+            target += "?" + parsed.query
+        method = self.command
+        # Range (video/.ts segments) always streams.
+        if self.headers.get("Range"):
+            headers = {"User-Agent": self.client_ua()}
+            for name in ("Accept", "Accept-Language", "If-Range"):
+                value = self.headers.get(name)
+                if value:
+                    headers[name] = value
+            headers["Range"] = self.headers.get("Range")
+            headers["Referer"] = "https://www.redgifs.com/"
+            try:
+                _st, _hdrs, resp, token = pool_stream(
+                    host, "GET", target, headers, timeout=30)
+            except Exception as exc:
+                self.send_text(502, "upstream failed: %s" % exc)
+                return
+            self.stream_response_pooled(resp, token)
+            return
+        headers = {"User-Agent": self.client_ua()}
+        for name in ("Accept", "Accept-Language"):
+            value = self.headers.get(name)
+            if value:
+                headers[name] = value
+        cookies = self.headers.get("Cookie")
+        if cookies:
+            headers["Cookie"] = cookies
+        auth = self.headers.get("Authorization")
+        if auth:
+            headers["Authorization"] = auth
+        _own = self._own_base()
+        referer = self.headers.get("Referer") or ""
+        if referer.startswith(_own + "/redapi/"):
+            referer = "https://www.redgifs.com/"
+        elif referer.startswith(_own + "/red/"):
+            referer = ("https://www.redgifs.com/"
+                       + referer[len(_own + "/red/"):])
+        elif referer.startswith(_own):
+            referer = "https://www.redgifs.com/"
+        headers["Referer"] = referer or "https://www.redgifs.com/"
+        origin = self.headers.get("Origin") or ""
+        if origin.startswith(_own):
+            origin = "https://www.redgifs.com"
+        headers["Origin"] = origin or "https://www.redgifs.com"
+        if content_type:
+            headers["Content-Type"] = content_type
+        # Cache: /static/ chunks (hashed names) 86400s; the /red/
+        # shell 300s; API never cached (token/feed are dynamic).
+        cache_key = None
+        cache_ttl = 0
+        if method == "GET" and not cookies:
+            _ua = self.client_ua()
+            _cls = "m" if ("Mobile" in _ua or "Android" in _ua) else "d"
+            if rest.startswith("/static/"):
+                cache_ttl = 86400
+            elif rest == "/":
+                cache_ttl = 300
+            if cache_ttl > 0:
+                cache_key = (method, path, _cls)
+                hit = _cache_get(cache_key)
+                if hit is not None:
+                    _status, _hdrs, _body, _at, _ttl = hit
+                    self._send_proxied(_status, _hdrs, _body,
+                                       cache_hit=True)
+                    return
+        try:
+            status, resp_headers, body = pool_request(
+                host, method, target, headers,
+                body=raw or None, timeout=30)
+        except Exception as exc:
+            self.send_text(502, "upstream failed: %s" % exc)
+            return
+        ctype = _header_get(resp_headers, "Content-Type") or ""
+        body = self._rewrite_body(body, ctype)
+        if method == "GET" and status == 200 \
+                and ctype.startswith("text/html"):
+            if not looks_like_page(body):
+                self.send_text(502, "upstream blocked (challenge page)")
+                return
+            body = _inject_switch_pill(body, "red")
+        if cache_key is not None and status == 200:
+            _cache_put(cache_key, status, resp_headers, body, cache_ttl)
+        self._send_proxied(status, resp_headers, body)
+
     def _send_proxied(self, status, resp_headers, body, cache_hit=False):
         """Send a reverse-proxied response: status, headers (with
         Location rewritten to this origin, Set-Cookie passed through),
@@ -1595,6 +1769,14 @@ class Handler(BaseHTTPRequestHandler):
                 or parsed.path == "/tikm" \
                 or parsed.path.startswith("/tikm/"):
             self.handle_tik_proxy(parsed)
+            return
+
+        # v3.18: redgifs.com as a third site (/red/ -> the site,
+        # /redapi/ -> api.redgifs.com).
+        if parsed.path == "/red" or parsed.path.startswith("/red/") \
+                or parsed.path == "/redapi" \
+                or parsed.path.startswith("/redapi/"):
+            self.handle_red_proxy(parsed)
             return
 
         # v2.6: everything else is the real site, served from this
@@ -1903,6 +2085,25 @@ def _warmup_loop(port):
                 try:
                     req = urllib.request.Request(
                         "http://127.0.0.1:%d/tik%s" % (port, path),
+                        headers={"User-Agent": ua})
+                    with opener.open(req, timeout=15) as r:
+                        r.read()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # v3.18: also warm the redgifs homepage + its /static chunks.
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/red/" % port,
+                headers={"User-Agent": ua})
+            with opener.open(req, timeout=15) as r:
+                red_html = r.read().decode("utf-8", "ignore")
+            for path in sorted(set(re.findall(
+                    r'/static/[A-Za-z0-9._-]+\.js', red_html))):
+                try:
+                    req = urllib.request.Request(
+                        "http://127.0.0.1:%d/red%s" % (port, path),
                         headers={"User-Agent": ua})
                     with opener.open(req, timeout=15) as r:
                         r.read()
