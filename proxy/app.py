@@ -60,6 +60,30 @@ in Iran, so the phone cannot reach them directly with VPN off. The phone
 talks ONLY to this service and this service — running
 outside Iran — fetches the bytes and streams them back.
 
+v3.19 (2026-11-28) — WEAK-LINE PLAYBACK + SPEED (transcode-once HLS):
+  NEW proxy/hls.py: one ffmpeg invocation per video (first request)
+  produces 3 HLS renditions (240p ~300k, 360p ~600k, 480p ~1000k;
+  H.264 + AAC, 4 s segments, aligned GOP, EVENT playlists) + a
+  progressive 360p MP4 (faststart). Cache on the ephemeral disk,
+  LRU, 700 MB cap (~1 GB Railway free disk). One transcode at a
+  time (FIFO queue); a queued video falls back to the original mp4
+  for that play. Served at /lite/<name>/master.m3u8 (+ media
+  playlists, .ts segments, 360.mp4) and /lite-status (JSON diag).
+  The video page gets an injected player script (xfree HTML only):
+  native HLS if supported, else hls.js 1.5.13 light (pinned,
+  served as /hls.js, 296 KB, cached); video.currentSrc is kept on
+  the ORIGINAL mp4 URL so the subtitle engine keeps working;
+  fallback chain HLS -> light 360p MP4 -> original mp4. ffmpeg
+  added to the Dockerfile (apt-get, bookworm 5.1).
+  SPEED KNOBS MEASURED AND REJECTED (see NOTES-proxy-3.19.md):
+  pool 6 -> 12 (browser opens max 6/host; pool already matches),
+  TCP_NODELAY (local TTFB already <1 ms; live TTFB is 0.5 s of
+  network RTT), VIDEO_CHUNK 1 MB -> 64 KB (first-byte saving
+  ~50 ms, costs 16x syscalls), Brotli (not in stdlib), immutable
+  headers (upstream already sends max-age=31536000), parallel
+  Range prefetch (unneeded once light renditions exist), request
+  collapsing (single user, no concurrency to collapse).
+
 v3.18 (2026-11-28) — THIRD SITE, NO APP INSTALL:
   redgifs.com joins through the proxy only: /red/ reverse-proxies
   www.redgifs.com (React SPA) and /redapi/ reverse-proxies
@@ -146,6 +170,7 @@ has monthly hours/bandwidth limits — fine for personal use.
 
 import gzip
 import http.client
+import json
 import os
 import re
 import threading
@@ -157,6 +182,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import dub as dub_mod  # v3.2: live Persian dubbing (stdlib only, no keys)
+import hls as hls_mod  # v3.19: transcode-once HLS light renditions
 
 ALLOWED_HOSTS = {
     "thumbs.xfree.com",
@@ -206,7 +232,7 @@ RELAY_HOSTS = {
 # old references fail loudly instead of silently reappearing.
 TRANSLATE_INJECT = ""
 
-PROXY_VERSION = "3.18"
+PROXY_VERSION = "3.19"
 # v3.12: PROXY_BASE is now the FALLBACK public base only. The live
 # base is derived per request from the Host header (_own_base), so
 # the same code serves correct self-URLs on Render AND Railway
@@ -513,6 +539,23 @@ def fetch_stream(url, headers, timeout=30):
     stream — pooling would block the slot for the whole playback)."""
     req = urllib.request.Request(url, headers=headers)
     return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _inject_lite_player(body):
+    """v3.19: the light-player script (see proxy/hls.py). Appended
+    before </body> on xfree HTML pages only — never on tik/red
+    pages (their videos stay as-is). The script is inert unless a
+    main video element exists; a failure inside it just leaves the
+    original video playing."""
+    try:
+        text = body.decode("utf-8")
+    except Exception:
+        return body
+    tag = '<script>' + hls_mod.LITE_PLAYER_JS + '</script>'
+    idx = text.lower().rfind("</body>")
+    if idx >= 0:
+        return (text[:idx] + tag + text[idx:]).encode("utf-8")
+    return (text + tag).encode("utf-8")
 
 
 def _inject_switch_pill(body, site):
@@ -1426,9 +1469,14 @@ class Handler(BaseHTTPRequestHandler):
         # v3.17: site-switch pill on xfree HTML pages («تیک‌پورن» ->
         # /tik/). Injected AFTER the Jina fallback too, so a Jina
         # page would also carry it; cached pages store the pill.
+        # v3.19: light-player script (HLS 240/360/480p + 360p MP4
+        # fallback, original mp4 as the last resort; the script
+        # keeps video.currentSrc on the original mp4 so subtitles
+        # keep working). Injected on xfree HTML only.
         if method == "GET" and status == 200 \
                 and ctype.startswith("text/html"):
             body = _inject_switch_pill(body, "xfree")
+            body = _inject_lite_player(body)
         if cache_key is not None and status == 200:
             if ctype.startswith("text/html") and not looks_like_page(body):
                 pass  # never cache a challenge page
@@ -1672,6 +1720,136 @@ class Handler(BaseHTTPRequestHandler):
             _cache_put(cache_key, status, resp_headers, body, cache_ttl)
         self._send_proxied(status, resp_headers, body)
 
+    def _serve_local_file(self, path, content_type, cache_control):
+        """Serve a file from the proxy's disk with Range support,
+        streamed in 1 MB chunks (never read whole into memory).
+        Used for HLS segments + the light 360p MP4."""
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            self.send_text(404, "not found")
+            return
+        start, end = 0, size - 1
+        status = 200
+        rng = self.headers.get("Range") or ""
+        m = re.match(r"bytes=(\d*)-(\d*)\s*$", rng)
+        if m:
+            a, b = m.group(1), m.group(2)
+            if a == "" and b != "":
+                start = max(0, size - int(b))
+            elif a != "":
+                start = int(a)
+                if b != "":
+                    end = min(int(b), size - 1)
+            if start > end or start >= size:
+                self.send_response(416)
+                self.send_header("Content-Range",
+                                 "bytes */%d" % size)
+                self.send_header("X-Proxy-Version", PROXY_VERSION)
+                self.end_headers()
+                return
+            status = 206
+        length = end - start + 1
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        if status == 206:
+            self.send_header("Content-Range",
+                             "bytes %d-%d/%d" % (start, end, size))
+        if cache_control:
+            self.send_header("Cache-Control", cache_control)
+        self.send_header("X-Proxy-Version", PROXY_VERSION)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                left = length
+                while left > 0:
+                    chunk = f.read(min(1024 * 1024, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client stopped / seeked away — normal
+
+    def handle_lite(self, parsed):
+        """v3.19: light renditions for xfree videos.
+        /lite/<name>/master.m3u8  -> ABR master playlist (blocks
+          up to ~8 s for the first segment, else 503 + retry).
+        /lite/<name>/<240|360|480>.m3u8 -> media playlist (grows
+          while the transcode runs; no-cache).
+        /lite/<name>/<rend>_%03d.ts -> HLS segment (immutable).
+        /lite/<name>/360.mp4 -> progressive 360p MP4, only once
+          the transcode finished (else 503); repeat-play / old-
+          WebView fallback.
+        /lite-status -> JSON diagnostics (ffmpeg, cache, jobs).
+        Any failure degrades to the original mp4: the injected
+        player falls back, and the job keeps running (or fails)
+        in the background for the next play."""
+        if parsed.path == "/lite-status":
+            self.send_text(200, json.dumps(hls_mod.status_dict()),
+                           "application/json")
+            return
+        parts = parsed.path.split("/")
+        if len(parts) != 4 or parts[1] != "lite":
+            self.send_text(404, "unknown lite path")
+            return
+        name, fname = parts[2], parts[3]
+        if not hls_mod.valid_name(name):
+            self.send_text(404, "bad video name")
+            return
+        if not hls_mod.ffmpeg_available():
+            self.send_text(503, "ffmpeg not available")
+            return
+        job = hls_mod.ensure_job(name)
+        if fname == "master.m3u8":
+            if job.state == "failed":
+                self.send_text(503, "transcode failed: %s"
+                               % job.error)
+                return
+            if not hls_mod.wait_for_first_segment(job):
+                self.send_text(503, "transcoding, retry")
+                return
+            self._send_proxied(
+                200, [("Content-Type",
+                       "application/vnd.apple.mpegurl"),
+                      ("Cache-Control", "no-cache")],
+                hls_mod.master_playlist(job))
+            return
+        if fname in ("240.m3u8", "360.m3u8", "480.m3u8"):
+            path = os.path.join(job.dir, fname)
+            try:
+                with open(path, "rb") as f:
+                    body = f.read()
+            except OSError:
+                self.send_text(503, "playlist not ready")
+                return
+            self._send_proxied(
+                200, [("Content-Type",
+                       "application/vnd.apple.mpegurl"),
+                      ("Cache-Control", "no-cache")], body)
+            return
+        if fname == "360.mp4":
+            if job.state != "done":
+                self.send_text(503, "transcoding, retry")
+                return
+            self._serve_local_file(
+                os.path.join(job.dir, fname), "video/mp4",
+                "public, max-age=31536000, immutable")
+            return
+        m = re.match(r"^(240|360|480)_(\d+)\.ts$", fname)
+        if m:
+            self._serve_local_file(
+                os.path.join(job.dir, fname), "video/MP2T",
+                "public, max-age=31536000, immutable")
+            return
+        self.send_text(404, "unknown lite file")
+
     def _send_proxied(self, status, resp_headers, body, cache_hit=False):
         """Send a reverse-proxied response: status, headers (with
         Location rewritten to this origin, Set-Cookie passed through),
@@ -1745,6 +1923,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.handle_binary(query, "video")
                 return
             self.handle_reverse_proxy(parsed)
+            return
+
+        # v3.19: light renditions (HLS 240/360/480p + 360p MP4)
+        # for xfree videos, transcoded once and cached. /hls.js is
+        # the pinned hls.js light build the injected player loads.
+        if parsed.path == "/lite-status" \
+                or parsed.path.startswith("/lite/"):
+            self.handle_lite(parsed)
+            return
+        if parsed.path == "/hls.js":
+            self._serve_local_file(
+                os.path.join(os.path.dirname(__file__), "static",
+                             "hls.light.min.js"),
+                "text/javascript",
+                "public, max-age=31536000, immutable")
             return
 
         # v3.1: generic relay for Google/Apple/Translate/etc.
